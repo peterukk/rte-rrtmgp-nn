@@ -10,165 +10,294 @@ may be used for training e.g. a neural network version of RRTMGP
 
 @author: Peter Ukkonen
 """
-
-import os, subprocess, argparse
+import torch
+import torch.nn as nn
+import torch.nn.parameter as Parameter
+import torch.nn.functional as F
+from torch import Tensor
+from typing import List, Tuple, Final, Optional
 import sys
 import numpy as np
 from numba import jit, njit, prange
 from netCDF4 import Dataset
-# from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
-def save_model_netcdf(fpath_netcdf, model, activation_names, input_names, 
-                    emulator_target,
-                    xmin, xmax, ymean=None, ystd=None, y_scaling_comment=None, 
-                    x_scaling_comment=None, data_comment=None, model_comment=None):
-    # Model = Keras Sequential Model object describing a Dense NN
-    # activation_names = numpy array of strings describing the activation function used
-    #   function used in each hidden+output layer (e.g. ['relu', 'linear'] - 
-    #   these need to correspond to the names in Neural-Fortran
-    # input_names = numpy array of strings containing names of inputs - 
-    #   the gas names need to correspond to the names used in RRTMGP-NN
-    # xmin, xmax = numpy arrays containing the min/max values of the inputs,  
-    #   required for pre-processing
-    #  OPTIONAL ARGUMENTS - if present, assumed predictand is absorbtion/Rayleigh
-    #  cross-sections, otherwise Planck fraction
-    # ymean, ystd = numpy arrays containing the mean and standard deviation of
-    #   outputs, required for post-processing
-    
-    from netCDF4 import Dataset, stringtochar
-    
-    # Create a netCDF file specifying the NN. in case of two hidden layers it will
-    # look like this:
-    # dimensions
-    #   nn_layers  : 3        <--- does not include the input layer
-    #   nn_dim_inp    : 7     <--- nn_dim_* specifies the length of a dimension
-    #   nn_dim_hidden1: 16
-    #   nn_dim_hidden2: 16
-    #   nn_dim_outp   : 224
-   #
-    # variables:
-    #   integer nn_dimsize(layers) = [16,16,224]
-    #   float nn_weights_1(nn_dim_inp,     nn_dim_hidden1)
-    #   float nn_bias_1(nn_dim_hidden1)
-    #   float nn_weights_2(nn_dim_hidden1, nn_dim_hidden2)
-    #   float nn_bias_2(nn_dim_hidden2)
-    #   float nn_weights_3(nn_dim_hidden2, nn_dim_outp)
-    #   float nn_bias_3(nn_dim_outp)
-    #   string nn_inputs(nn_dim_inp)
-    #   string nn_activation(layers)    ...
 
-    # Create a netCDF file
-    dat_new     = Dataset(fpath_netcdf,'w')
-    # Number of NN layers
-    nlay = np.size(model.layers) 
-    # Number of inputs
-    nx = model.layers[0].get_weights()[0].shape[0]
-
-    # Create initial dimensions
-    dat_new.createDimension('nn_layers',nlay)
-
-    # The first NN dimension corresponds to the input (but it's not a NN layer)
-    str_dim_prev = 'nn_dim_input'
-    dat_new.createDimension(str_dim_prev, nx)
-    # Create initial variables
-    nc_dimsize      = dat_new.createVariable("nn_dimsize","i4",("nn_layers"))
-    nc_dimsize.long_name = "Dimension of each layer, not including the input layer"
-    nc_activ        = dat_new.createVariable("nn_activation","str",("nn_layers"))
-    nc_input        = dat_new.createVariable("nn_inputs","str",(str_dim_prev))
-    nc_input.long_name = 'Specifies the inputs in their correct order'
-    nc_input_coeffs_max   = dat_new.createVariable("nn_input_coeffs_max","f4",(str_dim_prev))
-    nc_input_coeffs_min   = dat_new.createVariable("nn_input_coeffs_min","f4",(str_dim_prev))
-    nc_input_coeffs_max.long_name = 'xmax, see global attribute input_scaling_info'
-    nc_input_coeffs_min.long_name = 'xmin, see global attribute input_scaling_info'
-   
-    dat_new.emulator_target = emulator_target
-    if not data_comment==None:
-        dat_new.data_info = data_comment
-    if not model_comment==None:
-        dat_new.model_info = model_comment
-
-        
-    # NetCDF Fortran can't handle strings (ugh)
-    dat_new.createDimension('string_len', 32)
-    nc_activ_char   = dat_new.createVariable("nn_activation_char","S1",("nn_layers","string_len"))
-    nc_input_char   = dat_new.createVariable("nn_inputs_char","S1",(str_dim_prev,"string_len"))
-
-    # Write initial data
-    nc_activ_char[:,:] = ' '
-    nc_input_char[:,:] = ' '
-    
-    nc_input_coeffs_max[:] = xmax
-    nc_input_coeffs_min[:] = xmin
-
-    # loop over hidden layers + output layer, where each of these are associated
-    # with weights, biases and activation - create the dimension and variables of
-    # each layer
-    # does not include the input layer as this should not be considered a NN layer 
-    # according to Bishop's book (Pattern recognition and Machine Learning)
-    for i in range(nlay):
-        j = i+1
-
-        weight = model.layers[i].get_weights()[0]
-        bias = model.layers[i].get_weights()[1]
-        
-        dimsize         = weight.shape[1]
-        
-        # Create dimension corresponding to this layer
-        if (i<nlay-1):
-            str_dim_this    = 'nn_dim_hidden' + str(j)
+class gasopt_mlp(nn.Module):
+    is_longwave: Final[bool]
+    lock_weights: Final[bool]
+    def __init__(self, device,
+                xmin, xmax, ymean, ystd,
+                nn_w1, nn_w2, nn_w3,
+                nn_b1, nn_b2, nn_b3, 
+                lock_weights=True,
+                is_longwave=True):
+        super(gasopt_mlp, self).__init__()
+        self.nx = xmin.shape[0]
+        self.ny = ymean.shape[0]
+        self.is_longwave=is_longwave
+        if self.is_longwave:
+            self.ng = self.ny//2
         else:
-            str_dim_this    = 'nn_dim_outp'
-        dat_new.createDimension(str_dim_this,dimsize)
+            self.ng = self.ny
+        self.change_last_layer = False
+        self.nh = nn_w1.shape[1]
+        xmin  = torch.from_numpy(xmin)
+        xmax  = torch.from_numpy(xmax)
+        xdiv = xmax - xmin
+        self.register_buffer('xmin', xmin)
+        self.register_buffer('xmax', xmax)
+        self.register_buffer('xdiv', xdiv)
+        ymean = torch.from_numpy(ymean[0:self.ng])
+        ystd  = torch.from_numpy(ystd[0:self.ng])
+        self.register_buffer('ymean', ymean)
+        self.register_buffer('ystd', ystd)
+        self.softsign =  nn.Softsign()
+        self.mlp1 = nn.Linear(self.nx, self.nh)
+        self.mlp2 = nn.Linear(self.nh, self.nh)
+        self.mlp3 = nn.Linear(self.nh, self.ny)
+        self.lock_weights=lock_weights 
+        print("gasopt_mlp_lw number of g-points: {}, hidden neurons: {}, inputs: {}".format(self.ng, self.nh, self.nx)) 
 
-        
-        # Create weight variable
-        str_weight = 'nn_weights_' + str(j)
-        str_bias  =  'nn_bias_' + str(j)
-        nc_weight  = dat_new.createVariable(str_weight,"f4",(str_dim_prev,str_dim_this))
-        nc_bias    = dat_new.createVariable(str_bias,  "f4",(str_dim_this))
-                                               
-        # Write the data
-        nc_dimsize[i]   = dimsize
-        nc_weight[:]    = weight
-        nc_bias[:]      = bias
-        # Write the activation function as a string
-        activ_str       = activation_names[i]
-        nc_activ[i]     = activ_str
-        
-        charfmt = "S{}".format(len(activ_str))
-        activ_chars = stringtochar(np.array(activ_str, charfmt))
-        
-        nc_activ_char[i,0:len(activ_str)] = activ_chars
-        
-        str_dim_prev = str_dim_this
+        self.mlp1.weight = torch.nn.Parameter(torch.from_numpy(nn_w1.T))
+        self.mlp2.weight = torch.nn.Parameter(torch.from_numpy(nn_w2.T))
+        self.mlp1.bias = torch.nn.Parameter(torch.from_numpy(nn_b1.T))
+        self.mlp2.bias = torch.nn.Parameter(torch.from_numpy(nn_b2.T))
+        self.mlp3.weight = torch.nn.Parameter(torch.from_numpy(nn_w3.T))
+        self.mlp3.bias = torch.nn.Parameter(torch.from_numpy(nn_b3.T))
+        if self.lock_weights:
+          self.mlp1.weight.requires_grad = False; self.mlp1.bias.requires_grad = False
+          self.mlp2.weight.requires_grad = False; self.mlp2.bias.requires_grad = False
+          if not self.change_last_layer:
+            self.mlp3.weight.requires_grad = False; self.mlp3.bias.requires_grad = False
 
-    if not np.any(ymean)==None:  
-        nc_output_coeffs_mean   = dat_new.createVariable("nn_output_coeffs_mean","f4",('nn_dim_outp'))
-        nc_output_coeffs_std    = dat_new.createVariable("nn_output_coeffs_std","f4",('nn_dim_outp'))
-        nyy = ymean.size
-        nc_output_coeffs_mean[0:nyy]    = ymean
-        nc_output_coeffs_std[0:nyy]     = ystd
-        nc_output_coeffs_mean.long_name = 'ymean(igpt) = mean(y_cross(igpt)**(1/8))'
-        nc_output_coeffs_std.long_name = 'ystd(igpt) = std(y_cross(igpt)**(1/8))'
+        self.to(device)
 
-    if not y_scaling_comment==None:
-        dat_new.output_scaling_info = y_scaling_comment
+    def forward(self, x, col_dry):
+        x = self.mlp1(x)
+        x = self.softsign(x)
+        x = self.mlp2(x)
+        x = self.softsign(x)
+        x = self.mlp3(x)
+
+        if self.is_longwave:
+            tau, pfrac = x.chunk(2,-1)
+            pfrac = torch.square(pfrac)
+            if self.change_last_layer:
+                pfrac = self.softmax(pfrac)
+        else:
+            tau = x 
+
+        # if col_dry is not None:
+        # print("shape coldry", col_dry.shape, "tau", tau.shape, "ystd", self.ystd.shape)
+        tau = col_dry * torch.pow(self.ystd*tau + self.ymean,8)
+        # if self.change_last_layer:
+        #     tau = 1e-19*tau 
+    #    ! Postprocess absorption output: reverse standard scaling and square root scaling
+    #    tau(igpt,ilay,icol) = (ystd(igpt) * outp_both(igpt,ilay,icol) + ymeans(igpt))**8
+    #    ! Optical depth from cross-sections
+    #    tau(igpt,ilay,icol) = tau(igpt,ilay,icol)*col_dry_wk(ilay,icol)
+        if self.is_longwave:
+            return tau, pfrac
+        else:
+            return tau
         
-    for i in range(nx):
-        input_str   = input_names[i]
-        nc_input[i] = input_str
-        
-        charfmt = "S{}".format(len(input_str))
-        input_chars = stringtochar(np.array(input_str, charfmt))
-        
-        nc_input_char[i,0:len(input_str)] = input_chars
-    
-    if not x_scaling_comment==None:
-        dat_new.input_scaling_info = x_scaling_comment
+def load_gas_optics_model(gasopt_file, device, num_outputs_desired):#, lock_weights):
+  import xarray as xr
+  ds = xr.open_dataset(gasopt_file) # Open netCDF file with saved weights and normalization coefficients
+  input_str = ds.nn_inputs
+  if 'cfc11' in input_str.values:
+      is_longwave=True 
+  else: 
+      is_longwave=False 
 
-    dat_new.close()
+  nn_w1 = ds['nn_weights_1'][:].values
+  nn_w2 = ds['nn_weights_2'][:].values
+  nn_w3 = ds['nn_weights_3'][:].values
+
+  nn_b1 = ds['nn_bias_1'][:].values
+  nn_b2 = ds['nn_bias_2'][:].values
+  nn_b3 = ds['nn_bias_3'][:].values
+
+  ynorm_lw_mean = ds['nn_output_coeffs_mean'][:].values 
+  ynorm_lw_std =  ds['nn_output_coeffs_std'][:].values 
+
+  xnorm_lw_max = ds['nn_input_coeffs_max'][:].values 
+  xnorm_lw_min =  ds['nn_input_coeffs_min'][:].values 
+  # ng = 32
+  nn = gasopt_mlp(device, xnorm_lw_min, xnorm_lw_max, 
+                      ynorm_lw_mean, ynorm_lw_std,
+                      nn_w1, nn_w2, nn_w3,
+                      nn_b1, nn_b2, nn_b3, num_outputs_desired=num_outputs_desired, is_longwave=is_longwave)#, lock_weights=lock_weights)
+  infostr = summary(nn)
+  return nn 
 
 
+def save_model_netcdf(
+    fpath_netcdf,
+    model,
+    activation_names,
+    input_names,
+    emulator_target,
+    xmin,
+    xmax,
+    ymean=None,
+    ystd=None,
+    y_scaling_comment=None,
+    x_scaling_comment=None,
+    data_comment=None,
+    model_comment=None,
+):
+    """
+    Save a Dense Keras model to the legacy RRTMGP NetCDF format.
+
+    Works with Keras 3 by ignoring non-weighted layers (e.g. InputLayer)
+    and by reading weights from the actual Dense layers only.
+    """
+    from netCDF4 import Dataset, stringtochar
+    import numpy as np
+
+    def _layer_weights(layer):
+        """Return (kernel, bias) as NumPy arrays, or (None, None) if absent."""
+        weights = layer.get_weights()
+        if len(weights) < 2:
+            return None, None
+        return np.asarray(weights[0]), np.asarray(weights[1])
+
+    # Keep only layers that really have kernel/bias weights
+    weighted_layers = []
+    for layer in model.layers:
+        kernel, bias = _layer_weights(layer)
+        if kernel is not None and bias is not None:
+            weighted_layers.append(layer)
+
+    if not weighted_layers:
+        raise ValueError(
+            "No weighted layers found. Make sure the model is built and contains Dense layers."
+        )
+
+    # Infer input dimension from the first weighted layer
+    first_kernel, _ = _layer_weights(weighted_layers[0])
+    nx = first_kernel.shape[0]
+    nlay = len(weighted_layers)
+
+    # Basic validation
+    if len(activation_names) != nlay:
+        raise ValueError(
+            f"activation_names has length {len(activation_names)}, but model has {nlay} weighted layers."
+        )
+    if len(input_names) != nx:
+        raise ValueError(
+            f"input_names has length {len(input_names)}, but model input dimension is {nx}."
+        )
+
+    with Dataset(fpath_netcdf, "w", format="NETCDF4") as dat_new:
+        # Dimensions
+        dat_new.createDimension("nn_layers", nlay)
+        str_dim_prev = "nn_dim_input"
+        dat_new.createDimension(str_dim_prev, nx)
+
+        # Variables
+        nc_dimsize = dat_new.createVariable("nn_dimsize", "i4", ("nn_layers",))
+        nc_dimsize.long_name = "Dimension of each layer, not including the input layer"
+
+        nc_activ = dat_new.createVariable("nn_activation", str, ("nn_layers",))
+        nc_input = dat_new.createVariable("nn_inputs", str, (str_dim_prev,))
+        nc_input.long_name = "Specifies the inputs in their correct order"
+
+        nc_input_coeffs_max = dat_new.createVariable(
+            "nn_input_coeffs_max", "f4", (str_dim_prev,)
+        )
+        nc_input_coeffs_min = dat_new.createVariable(
+            "nn_input_coeffs_min", "f4", (str_dim_prev,)
+        )
+        nc_input_coeffs_max.long_name = "xmax, see global attribute input_scaling_info"
+        nc_input_coeffs_min.long_name = "xmin, see global attribute input_scaling_info"
+
+        dat_new.emulator_target = emulator_target
+        if data_comment is not None:
+            dat_new.data_info = data_comment
+        if model_comment is not None:
+            dat_new.model_info = model_comment
+
+        # NetCDF Fortran-friendly string storage
+        dat_new.createDimension("string_len", 32)
+        nc_activ_char = dat_new.createVariable(
+            "nn_activation_char", "S1", ("nn_layers", "string_len")
+        )
+        nc_input_char = dat_new.createVariable(
+            "nn_inputs_char", "S1", (str_dim_prev, "string_len")
+        )
+
+        nc_activ_char[:, :] = " "
+        nc_input_char[:, :] = " "
+
+        nc_input_coeffs_max[:] = np.asarray(xmax)
+        nc_input_coeffs_min[:] = np.asarray(xmin)
+
+        # Write layer weights
+        for i, layer in enumerate(weighted_layers):
+            j = i + 1
+            weight, bias = _layer_weights(layer)
+
+            dimsize = weight.shape[1]
+
+            if i < nlay - 1:
+                str_dim_this = f"nn_dim_hidden{j}"
+            else:
+                str_dim_this = "nn_dim_outp"
+            dat_new.createDimension(str_dim_this, dimsize)
+
+            str_weight = f"nn_weights_{j}"
+            str_bias = f"nn_bias_{j}"
+            nc_weight = dat_new.createVariable(
+                str_weight, "f4", (str_dim_prev, str_dim_this)
+            )
+            nc_bias = dat_new.createVariable(str_bias, "f4", (str_dim_this,))
+
+            nc_dimsize[i] = dimsize
+            nc_weight[:] = weight
+            nc_bias[:] = bias
+
+            activ_str = str(activation_names[i])
+            nc_activ[i] = activ_str
+
+            charfmt = f"S{len(activ_str)}"
+            activ_chars = stringtochar(np.array(activ_str, charfmt))
+            nc_activ_char[i, 0 : len(activ_str)] = activ_chars
+
+            str_dim_prev = str_dim_this
+
+        # Output scaling coefficients, if present
+        if ymean is not None and ystd is not None:
+            nc_output_coeffs_mean = dat_new.createVariable(
+                "nn_output_coeffs_mean", "f4", ("nn_dim_outp",)
+            )
+            nc_output_coeffs_std = dat_new.createVariable(
+                "nn_output_coeffs_std", "f4", ("nn_dim_outp",)
+            )
+            ymean = np.asarray(ymean)
+            ystd = np.asarray(ystd)
+            nyy = ymean.size
+            nc_output_coeffs_mean[0:nyy] = ymean
+            nc_output_coeffs_std[0:nyy] = ystd
+            nc_output_coeffs_mean.long_name = (
+                "ymean(igpt) = mean(y_cross(igpt)**(1/8))"
+            )
+            nc_output_coeffs_std.long_name = "ystd(igpt) = std(y_cross(igpt)**(1/8))"
+
+        if y_scaling_comment is not None:
+            dat_new.output_scaling_info = y_scaling_comment
+
+        for i in range(nx):
+            input_str = str(input_names[i])
+            nc_input[i] = input_str
+
+            charfmt = f"S{len(input_str)}"
+            input_chars = stringtochar(np.array(input_str, charfmt))
+            nc_input_char[i, 0 : len(input_str)] = input_chars
+
+        if x_scaling_comment is not None:
+            dat_new.input_scaling_info = x_scaling_comment
 
 def load_rrtmgp(fname,predictand, dcol=1, skip_lastlev=False, skip_firstlev=False,expfirst=False):
     # Load data for training a GAS OPTICS (RRTMGP) emulator,
@@ -469,6 +598,7 @@ def scale_gasopt(x_raw, y_raw, col_dry, scale_inputs=False, scale_outputs=False,
     else: return x,y
     
 def scale_outputs_wrapper(y_raw, col_dry, predictand, ymean=None, ystd=None):
+    print("y raw shape", y_raw.shape)
     ny = y_raw.shape[1]
     if (predictand == 'lw_planck_frac'):
         nfac = 2
@@ -510,14 +640,13 @@ def scale_outputs_wrapper(y_raw, col_dry, predictand, ymean=None, ystd=None):
         nfac = 8
 
         y   = preproc_tau_to_crossection(y_raw, col_dry)
-
-        if np.any(ymean)==None:
-            ymean = np.zeros(ny); ystd = np.zeros(ny)
-            for i in range(ny):
-                ymean[i] = np.mean(y[:,i]**(1/nfac))
-                # ystd[i]  = np.std(y[:,i]**(1/nfac))
-            ystd = np.repeat(np.std(y**(1/nfac)),ny)
-                
+        # if np.any(ymean)==None:
+        ymean = np.zeros(ny); ystd = np.zeros(ny)
+        for i in range(ny):
+            ymean[i] = np.mean(y[:,i]**(1/nfac))
+            # ystd[i]  = np.std(y[:,i]**(1/nfac))
+        ystd = np.repeat(np.std(y**(1/nfac)),ny)
+        # print("ymean", ymean)
         # Scale data
         y    = scale_outputs(y_raw, col_dry, nfac, ymean, ystd)
     return y, ymean, ystd
@@ -537,6 +666,7 @@ def scale_outputs(y_raw, col_dry=None, nfac=1,
     else:
         y = preproc_tau_to_crossection(y_raw, col_dry)
 
+    # print("y mean ", y_mean, "sig", y_sigma, "shape y", y.shape, "max", y.max())
     # Scale using power-scaling followed by standard-scaling
     y   = preproc_pow_standardization(y, nfac, y_mean, y_sigma)
     return y

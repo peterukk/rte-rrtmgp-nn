@@ -166,11 +166,11 @@ program rrtmgp_rfmip_sw
   ! Use neural networks for gas optics?  if NN models provided, set to true, but can also be overriden
   use_rrtmgp_nn      = .false.
   ! Save fluxes
-  save_flux    = .false.
+  save_flux    = .true.
   ! compare fluxes to reference code as well as line-by-line (RFMIP only)
   compare_flux = .false.
   ! Compute fluxes per g-point?
-  do_gpt_flux = .false.
+  do_gpt_flux = .true.
 
   print *, "Usage: rrtmgp_rfmip_sw [block_size] [rfmip_file] [k-distribution_file] [forcing_index (1,2,3)]"
   print *, "OR:  rrtmgp_rfmip_sw [block_size] [rfmip_file] [k-distribution_file] [forcing_index] [NN_sw_abs_file] [NN_sw_ray_file]"
@@ -393,7 +393,7 @@ program rrtmgp_rfmip_sw
     ! print *," max, min (tau)",   maxval(optical_props%tau), minval(optical_props%tau)
     ! print *," max, min (ssa)",   maxval(optical_props%ssa), minval(optical_props%ssa)
     ! print *," max, min (g)",   maxval(optical_props%g), minval(optical_props%g)
-    print *, "sum toa flux", sum(toa_flux(:,1))
+    ! print *, "sum toa flux", sum(toa_flux(:,1))
 
     if (nblocks==1) call system_clock(iTime2)
 

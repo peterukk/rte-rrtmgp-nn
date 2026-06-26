@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Python code for developing neural networks to replace RRTMGP look up tables
     
@@ -59,15 +61,43 @@ import os
 import sys
 import numpy as np
 
-import tensorflow as tf
-from tensorflow.keras import losses, optimizers
+# Keras 3 backend selection must happen before importing keras.
+os.environ.setdefault('KERAS_BACKEND', 'torch')
+
+import keras
+from keras import losses, optimizers, layers, Input, Model
+from keras.callbacks import EarlyStopping
+from keras import ops
 
 from ml_load_save_preproc import save_model_netcdf, \
     load_rrtmgp, scale_outputs_wrapper, \
     preproc_pow_standardization_reverse,\
     preproc_tau_to_crossection, preproc_minmax_inputs_rrtmgp
 from ml_scaling_coefficients import xcoeffs_all, input_names_all
-from ml_trainfuncs_keras import create_model_mlp, expdiff, hybrid_loss_wrapper
+from ml_trainfuncs_keras3_torch import expdiff, hybrid_loss_wrapper, RunRadiationScheme
+
+
+def create_model_mlp(nx, ny, neurons, activ, kernel_init='glorot_uniform'):
+    """Keras 3 / backend-agnostic MLP used for this training script."""
+    if len(activ) != len(neurons) + 1:
+        raise ValueError('Number of activations must be number of hidden layers + 1!')
+
+    inputs = Input(shape=(nx,), name='inputs')
+    x = inputs
+    for i, units in enumerate(neurons):
+        x = layers.Dense(
+            units,
+            activation=activ[i],
+            kernel_initializer=kernel_init,
+            name=f'dense_{i+1}',
+        )(x)
+    outputs = layers.Dense(
+        ny,
+        activation=activ[-1],
+        kernel_initializer=kernel_init,
+        name='dense_output',
+    )(x)
+    return Model(inputs=inputs, outputs=outputs, name='mlp_rrtmgp')
 
 
 def add_dataset(fpath, predictand, expfirst, x, y, col_dry, input_names, kdist, data_str):
@@ -177,6 +207,8 @@ fpath4  = datadir+"ml_training_lw_g128_CKDMIP-MMM-Big.nc"
 # and extended CKDMIP-Mean-Maximum-Minimum profiles
 # RFMIP ised used for validation
 fpaths = [fpath,fpath2,fpath3,fpath4]
+
+fpaths = [fpath]
 
 # ----------------------------------------------------------------------------
 # --------------- CONFIGURE: predictand, NN complexity etc -------------------
@@ -364,7 +396,7 @@ else:
     # then, square root scaling y: y=y**(1/nfac); cheaper and weaker version of 
     # log scaling. nfac = 8 for cross-sections, 2 for Planck fraction
     # After this, use standard-scaling (not for Planck fraction)
-    
+    # print("y tr raw max", y_tr_raw.max())
     y_tr, ymean, ystd = scale_outputs_wrapper(y_tr_raw, col_dry_tr, predictand)
 
 # ---------------------------------------------------------------------------
@@ -406,24 +438,11 @@ else:
 # --- Setup CPU or GPU training  ----
 # ------------------------------------------------------
 if use_gpu:
-    devstr = '/gpu:0'
     os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 else:
-    devstr = '/cpu:0'
-    # Maximum number of threads to use for OpenMP parallel regions.
-    os.environ["OMP_NUM_THREADS"] = str(num_cpu_threads)
-    # Without setting below 2 environment variables, it didn't work for me. Thanks to @cjw85 
-    os.environ["TF_NUM_INTRAOP_THREADS"] = str(num_cpu_threads)
-    os.environ["TF_NUM_INTEROP_THREADS"] = str(1)
-    os.environ['KMP_BLOCKTIME'] = '1' 
-
-    tf.config.threading.set_intra_op_parallelism_threads(
-        num_cpu_threads
-    )
-    tf.config.threading.set_inter_op_parallelism_threads(
-        1
-    )
-    tf.config.set_soft_device_placement(True)
+    # Keep CPU execution predictable when running the PyTorch backend.
+    os.environ['OMP_NUM_THREADS'] = str(num_cpu_threads)
+    os.environ['KMP_BLOCKTIME'] = '1'
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 
@@ -438,7 +457,6 @@ model.summary()
 
 # Create earlystopper and possibly other callbacks
 if early_stop_on_rfmip_fluxes:
-    from ml_trainfuncs_keras import RunRadiationScheme
 
     fpath_save_tmp = '../../neural/data/tmp_model.nc'
     
@@ -475,13 +493,9 @@ else:
 # ------------------------------------------------------
 # --- Start training -----------------------------------
 # ------------------------------------------------------
-# with tf.device(devstr):
-#     history = model.fit(x_tr, y_tr, epochs= epochs, batch_size=batch_size, 
-#                         shuffle=True,  verbose=1, callbacks=callbacks)     
-with tf.device(devstr):
-    history = model.fit(x_tr, y_tr, epochs= epochs, batch_size=batch_size, 
-                        shuffle=shuffle,  verbose=1, callbacks=callbacks) 
-    history = history.history
+history = model.fit(x_tr, y_tr, epochs=epochs, batch_size=batch_size,
+                    shuffle=shuffle, verbose=1, callbacks=callbacks)
+history = history.history
 
 if early_stop_on_rfmip_fluxes:
     plot_performance(history, hybrid_loss_expdiffs)
@@ -502,13 +516,13 @@ def save_model():
         hr_err_final = np.array(history['mean_relative_heating_rate_error'])[ind]
         forcing_err_final = np.array(history['mean_relative_forcing_error'])[ind]
         fpath_keras = "../../neural/data/" + source + "_" + predictand[3:] + "_" + \
-          neurons_str + "_HR_{:.2e}_FRC_{:.2e}.h5".format(hr_err_final, forcing_err_final)
+          neurons_str + "_HR_{:.2e}_FRC_{:.2e}.keras".format(hr_err_final, forcing_err_final)
     else:
         fpath_keras = "../../neural/data/" + source + "_" + predictand[3:] + "_" + \
-            neurons_str + ".h5"
-    model.save(fpath_keras,save_format='h5')
+            neurons_str + ".keras"
+    model.save(fpath_keras)
     
-    fpath_netcdf = fpath_keras[:-3]+".nc"
+    fpath_netcdf = fpath_keras[:-6]+".nc"
     
     print("Saving model from best epoch in both netCDF and HDF5 format to {}".format(fpath_netcdf))
     save_model_netcdf(fpath_netcdf, model, activ, input_names, kdist,
