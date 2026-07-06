@@ -47,7 +47,7 @@ from coefficients import RRTMGP_SPLITS#, WAVENUM_SPLITS
 
 # train_on_bands=True 
 
-def make_band_bounds(
+def make_band_bounds_sw(
     *,
     rrtmgp_splits: list[int],
     ng_per_band: list[int],
@@ -717,7 +717,7 @@ def main() -> None:
                 f"_alpha{args.alpha:.2f}.pt"
             )
         else:
-            args.output = f"sw_gasopt_ng{ng}_nh{args.nh}_alpha{args.alpha:.2f}.pt"
+            args.output = f"trained_models/sw_gasopt_ng{ng}_nh{args.nh}_alpha{args.alpha:.2f}.pt"
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -856,7 +856,7 @@ def main() -> None:
         print("Computing per-band flux weights from training data...")
         band_weights = compute_band_flux_weights(y_ref, device=device)
 
-        rrtmgp_bounds, band_bounds, ng = make_band_bounds(
+        rrtmgp_bounds, band_bounds, ng = make_band_bounds_sw(
             rrtmgp_splits=args.rrtmgp_splits,
             ng_per_band=args.ng_per_band,
             ng_ref=112,

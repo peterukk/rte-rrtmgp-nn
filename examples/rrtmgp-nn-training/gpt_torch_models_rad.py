@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Pytorch implementation of a two-stream SW radiation scheme using a two-stream approximation
-and neural network gas optics models, plus helper functions for loading existing gas optics models
+Pytorch implementation of a two-stream SW radiation scheme using neural network gas optics models, plus helper functions for loading existing gas optics models
+Differentiable radiative transfer equations (RTEs) allows training new gas optics models on fluxes (in specific bands or broadband fluxes), in which case 
+the spectral decomposition (in each band) becomes fully machine-learned (and may not use the correlated-k assumption)
 """
 import numpy as np
 import torch
@@ -62,13 +63,46 @@ def load_gas_optics_model(gasopt_file, device, lock_weights=False, is_shortwave=
   infostr = summary(nn)
   return nn 
 
+
+# RRTMGP's 14 SW bands: wavenumber limits and g-point ranges
+RRTMGP_WAVENUM_LOW  = [820, 2680, 3250, 4000, 4650, 5150, 6150, 7700, 8050, 12850, 16000, 22650, 29000, 38000]
+RRTMGP_WAVENUM_HIGH = [2680, 3250, 4000, 4650, 5150, 6150, 7700, 8050, 12850, 16000, 22650, 29000, 38000, 50000]
+RRTMGP_GPT_BOUNDS   = [0, 10, 18, 29, 37, 46, 56, 67, 71, 80, 89, 96, 102, 109, 112]  # g-pt boundary of each RRTMGP band
+
+def rrtmgp_bounds_to_wavenum_bounds(rrtmgp_band_bounds):
+    """
+    Convert custom band boundaries expressed in RRTMGP g-point space
+    (e.g. [0, 29, 80, 89, 102, 112]) to wavenumber boundaries (cm-1),
+    using the actual RRTMGP band edges — not nominal design targets.
+
+    Each boundary g must coincide with an RRTMGP band edge (i.e. g must
+    appear in RRTMGP_GPT_BOUNDS); raises if not, since a non-aligned
+    boundary cannot be represented exactly in RRTMGP g-point space.
+    """
+    wavenum_bounds = []
+    for g in rrtmgp_band_bounds:
+        if g == 0:
+            wavenum_bounds.append(RRTMGP_WAVENUM_LOW[0])      # 820
+        elif g == 112:
+            wavenum_bounds.append(RRTMGP_WAVENUM_HIGH[-1])    # 50000
+        else:
+            assert g in RRTMGP_GPT_BOUNDS, (
+                f"g-point boundary {g} does not align with any RRTMGP band edge "
+                f"{RRTMGP_GPT_BOUNDS}. Custom band boundaries must coincide with "
+                f"RRTMGP band edges."
+            )
+            band_idx = RRTMGP_GPT_BOUNDS.index(g)
+            # g is the END of band (band_idx - 1) and START of band band_idx
+            # Use the wavenumber at that shared edge
+            wavenum_bounds.append(RRTMGP_WAVENUM_LOW[band_idx])
+    return wavenum_bounds
+
 class mlp_gasopt_inlined_processing(nn.Module):
     """
     Gas optics neural networks: differs from GasOpticsMLP in that the post-processing is inlined.
-    Can be used for a pre-trained gas optics model, in which case weights (nn_w1,..) and 
+    This version if meant for training new gas optics in which case we don't have output normalisation coefficients (do_norm=false),
+    but it can also used with pre-trained gas optics model, in which case output scaling coefficients, weights (nn_w1,..) and 
     solar_source must be provided.
-    Contains the normalisation coefficients for pre-processing the inputs (xmin, xmax), 
-    and if using pre-trained models, also output scaling coefficients ymean, ystd. 
     If we are training a new model from scratch, ny (number of g-points) and nh (hidden neurons) are hyperparameters.
     """
     lock_weights: Final[bool]
@@ -127,53 +161,10 @@ class mlp_gasopt_inlined_processing(nn.Module):
           self.num_bands = 1
 
         if band_bounds is not None:
-            # RRTMGP band wavenumber limits, in the same g-point order as RRTMGP_BOUNDS
-            # Band 1: 820-2680, Band 2: 2680-3250, ..., Band 14: 38000-50000
-            # Plus a leading entry for the start of band 1 (820 cm-1) and 
-            # the SW lower limit (250 cm-1 is used conventionally but RRTMGP starts at 820)
-            RRTMGP_WAVENUM_LOW  = [820, 2680, 3250, 4000, 4650, 5150, 6150, 7700, 8050, 12850, 16000, 22650, 29000, 38000]
-            RRTMGP_WAVENUM_HIGH = [2680, 3250, 4000, 4650, 5150, 6150, 7700, 8050, 12850, 16000, 22650, 29000, 38000, 50000]
-            # Map from g-point index to RRTMGP band index (0-based)
-            # rrtmgp_bounds = [0, 29, 80, 89, 102, 112] means:
-            #   g-pts 0:29   → RRTMGP bands 0-2  (820–4000   cm-1)
-            #   g-pts 29:80  → RRTMGP bands 3-8  (4000–12850 cm-1)
-            #   g-pts 80:89  → RRTMGP band  9    (12850–16000 cm-1)
-            #   g-pts 89:102 → RRTMGP bands 10-11 (16000–29000 cm-1)
-            #   g-pts 102:112→ RRTMGP bands 12-13 (29000–50000 cm-1)
-            # Build a lookup: for each RRTMGP g-point boundary, what is the wavenumber?
-            # RRTMGP g-point band assignments (cumulative, 0-based band index):
-            RRTMGP_GPT_BOUNDS = [0, 10, 18, 29, 37, 46, 56, 67, 71, 80, 89, 96, 102, 109, 112]
-            # RRTMGP_GPT_BOUNDS[b]:RRTMGP_GPT_BOUNDS[b+1] are g-points of RRTMGP band b
-
-            def gpt_to_wavenum_low(gpt: int) -> int:
-                """Return the lower wavenumber of the RRTMGP band containing g-point gpt."""
-                for b in range(14):
-                    if gpt <= RRTMGP_GPT_BOUNDS[b + 1]:
-                        return RRTMGP_WAVENUM_LOW[b]
-                return RRTMGP_WAVENUM_LOW[13]
-
-            def gpt_to_wavenum_high(gpt: int) -> int:
-                """Return the upper wavenumber of the RRTMGP band containing g-point gpt."""
-                for b in range(14):
-                    if gpt <= RRTMGP_GPT_BOUNDS[b + 1]:
-                        return RRTMGP_WAVENUM_HIGH[b]
-                return RRTMGP_WAVENUM_HIGH[13]
-
-            # Derive wavenumber bounds for each custom band from rrtmgp_bounds
-            # rrtmgp_bounds[0]=0 → lower wavenumber of the band containing g-pt 0 = 820
-            # rrtmgp_bounds[1]=29 → g-pt 29 is the first g-pt of the next band, so upper wavenum
-            #                        of custom band 1 = lower wavenum of the band containing g-pt 29
-            # rrtmgp_bounds[-1]=112 → upper wavenumber = 50000
-            rb = self.rrtmgp_bounds  # e.g. [0, 29, 80, 89, 102, 112]
-            wavenum_bounds: List[int] = []
-            wavenum_bounds.append(RRTMGP_WAVENUM_LOW[0])   # start of first band = 820 cm-1
-            for i in range(1, len(rb) - 1):
-                # rb[i] is the first g-point of the next custom band
-                # so the boundary wavenumber is the lower limit of the RRTMGP band it starts in
-                wavenum_bounds.append(gpt_to_wavenum_low(rb[i]))
-            wavenum_bounds.append(RRTMGP_WAVENUM_HIGH[13])  # end of last band = 50000 cm-1
-
-            self.wavenum_bounds: List[int] = wavenum_bounds
+            print("band bounds is {} and rrtmgp_bounds is {}, now deriving wavenumber bounds from these".format(band_bounds, self.rrtmgp_bounds))
+           
+            # self.wavenum_bounds: List[int] = wavenum_bounds
+            self.wavenum_bounds: List[int] = rrtmgp_bounds_to_wavenum_bounds(self.rrtmgp_bounds)
             print(f"Derived wavenumber bounds: {self.wavenum_bounds}")
 
             # Precompute NIR/visible split for surface flux computation
@@ -202,6 +193,7 @@ class mlp_gasopt_inlined_processing(nn.Module):
                   f"transition: {self.i_gpt_nir_end}:{self.i_gpt_vis_start} "
                   f"(vis fraction={self.vis_transition_fraction:.3f}), "
                   f"visible: {self.i_gpt_vis_start}:{self.ng}")
+    
     
         print("do norm", do_norm)
         if nn_w1 is not None:
@@ -258,7 +250,6 @@ class mlp_gasopt_inlined_processing(nn.Module):
         else:
           tau = col_dry * torch.pow(tau,8)
           # print("mean tau after coldry, pow8", tau.mean().item())
-
         coeff=1e-17
         return tau*coeff
 
@@ -288,8 +279,6 @@ class mlp_gasopt_inlined_processing(nn.Module):
             # print("shape band weights", band_weights.shape)
             return band_weights.unsqueeze(0)  # (1, ng) matching RRTMGP format
         return solar_weights
-
-
 
 class SW_rad_torch(nn.Module):
     """
@@ -367,26 +356,17 @@ class SW_rad_torch(nn.Module):
 
         # -------------------------- SHORTWAVE -----------------------------
         # 
-
         # GAS OPTICAL PROPERTIES IN EACH LAYER
         # x_gas = torch.cat((temp, pres, vmr_h2o, o3, co2, n2o, ch4), dim=2)
         # x_gas = (x_gas - self.gas_optics_model_sw_abs.xmin) / self.gas_optics_model_sw_abs.div
-
-        # print("col_dry mean", col_dry.mean().item())
-        # for i in range(x_gas.shape[-1]):
-        #     print("x_gas {} min {} max {} mean {}".format(i,torch.min(x_gas[:,:,i]).item(), torch.max(x_gas[:,:,i]).item(),  torch.mean(x_gas[:,:,i]).item()))
 
         if self.is_rrtmgp:
           tau_sw      = self.gas_optics_model_sw_abs(x_gas, col_dry)
           tau_sw_scat = self.gas_optics_model_sw_ray(x_gas, col_dry)
         else:
-          # coeff=1e-17
-          # coeff=1e-21
-          # coeff=1e-16
-          tau_sw      = self.gas_optics_model_sw_abs(x_gas, col_dry) #*coeff
+          tau_sw      = self.gas_optics_model_sw_abs(x_gas, col_dry) 
           tau_sw      = torch.clamp(tau_sw,min=1e-9)
-          tau_sw_scat = self.gas_optics_model_sw_ray(x_gas, col_dry) #*coeff
-
+          tau_sw_scat = self.gas_optics_model_sw_ray(x_gas, col_dry) 
           # print("tau sw mean", tau_sw.mean().item(), "max", tau_sw.max().item())
           # print("tau sw scat mean", tau_sw_scat.mean().item(), "max", tau_sw_scat.max().item())
 
@@ -416,15 +396,6 @@ class SW_rad_torch(nn.Module):
             
         ref_diff, trans_diff, ref_dir, trans_dir_diff, trans_dir_dir = calc_ref_trans_sw(mu0_rep, tau_sw, ssa_sw, g_sw)
 
-        # print("ref diff shape", ref_diff.shape, "mu0", mu0_rep.shape, "tau", tau_sw.shape, "nlay", nlay)
-        # print("tau_sw 29,0 :", tau_sw[29,0,:], "mean", tau_sw.mean().item())
-
-        # print("ref diff 29,0 :", ref_diff[29,0,:], "mean", ref_diff.mean().item())
-        # print("tra diff 29,0 :", trans_diff[29,0,:], "mean", trans_diff.mean().item())
-        # print("ref dir 29,0 :", ref_dir[29,0,:], "mean", ref_dir.mean().item())
-        # print("trans_dir_diff 29,0 :", trans_dir_diff[29,0,:], "mean", trans_dir_diff.mean().item())
-        # print("tnoscat 29,0 :", trans_dir_dir[29,0,:], "mean", trans_dir_dir.mean().item())
-
         ref_diff            = ref_diff.view(nlay, -1)
         trans_diff          = trans_diff.view(nlay, -1)
         ref_dir             = ref_dir.view(nlay, -1)
@@ -438,11 +409,6 @@ class SW_rad_torch(nn.Module):
             # Here we apply softmax to ensure the solar weights sum to 1 (and are positive)
             toa_spectral = self.gas_optics_model_sw_abs.get_solar_weights()
             # toa_spectral = torch.softmax(self.gas_optics_model_sw_abs.sw_solar_weights,dim=-1)
-        
-        # print("shape inc toa", incoming_toa.shape, "toa spectral", toa_spectral.shape, "mu", mu0_comp.shape)        
-        # print("sum spectral", toa_spectral.sum().item(), "inc toa 1", incoming_toa[0])
-        # print("sum band 0", torch.sum(toa_spectral[:,self.gas_optics_model_sw_abs.band_bounds[0]:self.gas_optics_model_sw_abs.band_bounds[1]]))
-        # print("sum band rrtmgp", torch.sum(self.gas_optics_model_sw_abs.rrtmgp_sw_solar_weights[:,RRTMGP_BOUNDS[0]:RRTMGP_BOUNDS[1]]))
 
         incoming_toa = incoming_toa.unsqueeze(1)*toa_spectral*mu0_comp.unsqueeze(1)
         if printdebug:
@@ -462,7 +428,7 @@ class SW_rad_torch(nn.Module):
             print("albedo_surf_diff_sw min max", albedo_surf_diff_sw.min().item(), albedo_surf_diff_sw.max().item())
             print("ref_diff min max mean", ref_diff.min().item(), ref_diff.max().item(), ref_diff.mean().item()) 
             
-        flux_sw_up_gpt, flux_sw_dn_diffuse_gpt, flux_sw_dn_direct_gpt = adding_ica_sw(
+        flux_sw_up_gpt, flux_sw_dn_diffuse_gpt, flux_sw_dn_direct_gpt = adding_ica_sw_batchlast_opt(
                     incoming_toa, albedo_surf_diff_sw, albedo_surf_dir_sw, 
                     ref_diff, trans_diff, ref_dir, trans_dir_diff, trans_dir_dir, mu0_rep[0].view(-1))
 
@@ -472,30 +438,6 @@ class SW_rad_torch(nn.Module):
         flux_sw_dn_diffuse_gpt = torch.reshape(flux_sw_dn_diffuse_gpt, (nlev, batch_size, self.ng_sw))
         flux_sw_dn_direct_gpt = torch.reshape(flux_sw_dn_direct_gpt, (nlev, batch_size, self.ng_sw))
         
-        # if self.return_gpt_fluxes: # To be properly implemented later
-        #     # RRTMGP bands and g-points:
-        #     # bnd_limits_gpt
-        #     # 1,10     | 11,18    | 19,29    | 30,37   | 38,46     | 47,56     | 57,67     | 68,71      | 72,80      |  81,89    | 90, 96    | 97, 102   | 103, 109 | 110, 112 
-        #     # bnd_limits_wavenumber
-        #     # 820,2680 | 2680,3250 | 3250,4k | 4k,4650 | 4650,5150 | 5150,6150 | 6150,7700 | 7700,8050  | 8050,12850 | 12850,16k | 16k,22650 | 22650,29k | 29k,38k  | 38k,50k 
-        #     # in micrometers 
-        #     # 12.2,3.73| 3.73,3.08 | 3.08,2.5| 2.5,2.15| 2.15,1.94 | 1.94,1.63 | 1.63,1.3  | 1.3,1.24   | 1.24,0.78  | 0.78,0.62 | 0.62,0.44 | 0.44,0.34 | 0.34,0.26| 0.26  0.2 ]
-        #     # band 1        2         3           4           5         6             7         8              9           10         11          12         13         14
-        #     # E3SM wants:
-        #     # ! sols(pcols)      Direct solar rad on surface (< 0.7 micrometer)
-        #     # ! soll(pcols)      Direct solar rad on surface (>= 0.7 micrometer)
-        #     iend_ir = int(round((80/112)*self.ng_sw)) # RRTMGP bands 1-9 (g-points 1-80) encompass 820-12850 cm-1 (near-ir), see data/rrtmgp-data-sw-g112-210809.nc
-        #     iend_mix= int(round((89/112)*self.ng_sw)) # RRTMGP band 10 is in between UV/visible and near-IR, and bands 11-14 (89-112) are fully in visible range (> 14286 ! cm^-1)
-
-        #     # Sum over whole / parts of spectral dimension to get broadband / band-wise fluxes
-        #     sw_dir_dn_mixband = torch.sum(flux_sw_dn_direct[-1,:,iend_ir:iend_mix],dim=1,keepdim=True)
-        #     SOLL = torch.sum(flux_sw_dn_direct[-1,:,0:iend_ir],dim=1,keepdim=True) + 0.5*sw_dir_dn_mixband
-        #     SOLS = torch.sum(flux_sw_dn_direct[-1,:,iend_mix:],dim=1,keepdim=True) + 0.5*sw_dir_dn_mixband
-
-        #     sw_diff_dn_mixband = torch.sum(flux_sw_dn_diffuse[-1,:,iend_ir:iend_mix],dim=1,keepdim=True)
-        #     SOLLD = torch.sum(flux_sw_dn_diffuse[-1,:,0:iend_ir],dim=1,keepdim=True) + 0.5*sw_diff_dn_mixband
-        #     SOLSD = torch.sum(flux_sw_dn_diffuse[-1,:,iend_mix:],dim=1,keepdim=True) + 0.5*sw_diff_dn_mixband
-
         flux_sw_up          = torch.sum(flux_sw_up_gpt,dim=2)
         flux_sw_dn_diffuse  = torch.sum(flux_sw_dn_diffuse_gpt,dim=2)
         flux_sw_dn_direct   = torch.sum(flux_sw_dn_direct_gpt,dim=2)
@@ -540,11 +482,6 @@ class SW_rad_torch(nn.Module):
         # print("shape flux sw up 1", flux_sw_up.shape)
 
         if self.return_gpt_fluxes:
-            # SOLL[inds_zero] = 0.0
-            # SOLS[inds_zero] = 0.0
-            # SOLLD[inds_zero] = 0.0
-            # SOLSD[inds_zero] = 0.0
-            # return dT_rad, flux_sw_up, flux_sw_dn, flux_sw_dn_direct, SOLS, SOLL, SOLSD, SOLLD
             return dT_rad, flux_sw_up_gpt, flux_sw_dn_gpt, flux_sw_dn_direct_gpt
         else:
             return dT_rad, flux_sw_up, flux_sw_dn, flux_sw_dn_direct
@@ -707,12 +644,6 @@ def adding_ica_sw_batchlast_opt(incoming_toa, albedo_surf_diffuse, albedo_surf_d
         # Reverse arrays because next loop will go from top-of-atmosphere to surface
         albedo.reverse(); albedodir.reverse()
 
-        # print("albedo toa", albedo[0].view(-1,112)[0,:])
-        # print(" albedo mean",  torch.mean(albedo[0].view(-1,112)[0,:]))
-        # print("albedo sfc", albedo[-1].view(-1,112)[0,:])
-        # print("albedo sfc -1", albedo[-2].view(-1,112)[0,:])
-        # print(" albedo mean",  torch.mean(albedo[-2].view(-1,112)[0,:]))
-
         # At top-of-atmosphere, all upwelling radiation is due to scattering by the direct beam below that level
         fluxup = incoming_toa*albedodir[0]
         flux_up = torch.jit.annotate(List[Tensor], [])
@@ -747,93 +678,3 @@ def adding_ica_sw_batchlast_opt(incoming_toa, albedo_surf_diffuse, albedo_surf_d
         flux_up = torch.stack(flux_up)
 
         return flux_up, flux_dn_diffuse, flux_dn_direct
-
-# @torch.jit.script
-# @torch.compile(dynamic=False)
-def adding_ica_sw_inference(
-    incoming_toa: Tensor,
-    albedo_surf_diffuse: Tensor,
-    albedo_surf_direct: Tensor,
-    reflectance: Tensor,
-    transmittance: Tensor,
-    ref_dir: Tensor,
-    trans_dir_diff: Tensor,
-    trans_dir_dir: Tensor,
-) -> Tuple[Tensor, Tensor, Tensor]:
-
-    nlev, nbatch = reflectance.shape
-
-    # --- Upward sweep ---
-    # Only keep current-level scalars; no list accumulation needed.
-    # BUT: the downward sweep still needs albedo[jlev+1] at every level,
-    # so we cannot avoid storing the full arrays.
-    # We CAN avoid the Python list + reverse + stack overhead by writing
-    # directly into pre-allocated tensors — safe here because autograd
-    # is not running, so no version counter issues.
-    albedo    = torch.empty(nlev + 1, nbatch, dtype=reflectance.dtype,
-                             device=reflectance.device)
-    albedodir = torch.empty(nlev + 1, nbatch, dtype=reflectance.dtype,
-                             device=reflectance.device)
-
-    albedo[0]    = albedo_surf_diffuse
-    albedodir[0] = albedo_surf_direct
-
-    alb0  = albedo_surf_diffuse
-    adir0 = albedo_surf_direct
-
-    for k in range(nlev):
-        jlev = nlev - 1 - k
-        R  = reflectance[jlev]
-        T  = transmittance[jlev]
-        inv_denom = 1.0 / (1.0 - alb0 * R)
-        adir0 = ref_dir[jlev] + (trans_dir_dir[jlev] * adir0 + trans_dir_diff[jlev] * alb0) * T * inv_denom
-        alb0  = R + T * T * alb0 * inv_denom
-        albedo   [k + 1] = alb0
-        albedodir[k + 1] = adir0
-
-    # --- Downward sweep ---
-    flux_up         = torch.empty(nlev + 1, nbatch, dtype=reflectance.dtype,
-                                   device=reflectance.device)
-    flux_dn_diffuse = torch.empty(nlev + 1, nbatch, dtype=reflectance.dtype,
-                                   device=reflectance.device)
-    flux_dn_direct  = torch.empty(nlev + 1, nbatch, dtype=reflectance.dtype,
-                                   device=reflectance.device)
-
-    fluxdndir  = incoming_toa
-    fluxdndiff = torch.zeros(nbatch, dtype=reflectance.dtype,
-                              device=reflectance.device)
-
-    flux_up        [0] = incoming_toa * albedodir[nlev]   # TOA = slot nlev
-    flux_dn_direct [0] = fluxdndir
-    flux_dn_diffuse[0] = fluxdndiff
-
-    for jlev in range(nlev):
-        R     = reflectance[jlev]
-        T     = transmittance[jlev]
-        below = nlev - (jlev + 1)
-        alb1  = albedo   [below]
-        adir1 = albedodir[below]
-        fluxdndiff = ((T * fluxdndiff  + fluxdndir * (T * adir1 * R + trans_dir_diff[jlev])) / (1.0 - R * alb1))
-        fluxdndir  = fluxdndir * trans_dir_dir[jlev]
-        flux_dn_direct [jlev + 1] = fluxdndir
-        flux_dn_diffuse[jlev + 1] = fluxdndiff
-        flux_up        [jlev + 1] = fluxdndir * adir1 + fluxdndiff * alb1
-
-    return flux_up, flux_dn_diffuse, flux_dn_direct
-
-def adding_ica_sw(
-    incoming_toa, albedo_surf_diffuse, albedo_surf_direct,
-    reflectance, transmittance, ref_dir, trans_dir_diff, trans_dir_dir, mu0
-):
-    # if torch.is_grad_enabled():
-        # print("calling normal adding!")
-    return adding_ica_sw_batchlast_opt(
-        incoming_toa, albedo_surf_diffuse, albedo_surf_direct,
-        reflectance, transmittance, ref_dir, trans_dir_diff, trans_dir_dir, mu0
-    )
-    # else:
-    #     # print("calling inference adding!")
-    #     return adding_ica_sw_inference(
-    #         incoming_toa, albedo_surf_diffuse, albedo_surf_direct,
-    #         reflectance, transmittance, ref_dir, trans_dir_diff, trans_dir_dir
-    #     )
