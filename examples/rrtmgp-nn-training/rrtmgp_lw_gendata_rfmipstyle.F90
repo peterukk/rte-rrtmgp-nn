@@ -118,7 +118,7 @@ program rrtmgp_rfmip_lw
   ! RRTMGP inputs for NN development
   real(sp), dimension(:,:,:,:),         allocatable :: nn_gasopt_input ! (nfeatures,nlay,block_size,nblocks)
   ! logicals to control program
-  logical 	:: do_gpt_flux, save_input_vectors = .true.
+  logical 	:: do_gpt_flux, save_gpt_flux, save_input_vectors = .true.
   !
   ! Derived types from the RTE and RRTMGP libraries
   !
@@ -141,8 +141,10 @@ program rrtmgp_rfmip_lw
   !
   !  ------------ I/O and settings -----------------
   ! Compute fluxes per g-point?
-  do_gpt_flux   = .false.
-
+  do_gpt_flux   = .true.
+  save_gpt_flux = .true.
+  save_input_vectors = .true.
+  
   ! Identify the set of gases used in the calculation 
   ! The data file might have gases we're not interested in, so the gas names should be provided
   ! by the user somehow, checked that they're in the file, and then mapped to the k-distribution
@@ -472,6 +474,28 @@ program rrtmgp_rfmip_lw
   &   dim3_name="expt", dim2_name="site", dim1_name="layer", &
   &   long_name="layer number of dry air molecules")
 
+  call nndev_file_netcdf%define_variable("sfc_emis", &
+    &   dim2_name="expt", dim1_name="site", &
+    &   long_name="surface emissivity (broadband)")
+
+  call nndev_file_netcdf%define_variable("sfc_temperature", &
+    &   dim2_name="expt", dim1_name="site", &
+    &   long_name="surface temperature")
+
+
+  if (save_gpt_flux) then 
+
+    call nndev_file_netcdf%define_variable("gpt_flux_up", &
+    &   dim4_name="expt", dim3_name="site", dim2_name="level", dim1_name="gpt", &
+    &   long_name="spectral upwelling longwave flux", data_type_name="float")
+
+    call nndev_file_netcdf%define_variable("gpt_flux_dn", &
+    &   dim4_name="expt", dim3_name="site", dim2_name="level", dim1_name="gpt", &
+    &   long_name="spectral downwelling longwave flux", data_type_name="float")
+
+  end if 
+
+
   call nndev_file_netcdf%end_define_mode()
 
   call unblock_and_write(trim(nndev_file), 'pres_level', p_lev)
@@ -491,6 +515,13 @@ program rrtmgp_rfmip_lw
     call unblock_and_write(trim(nndev_file), 'planck_fraction', planck_frac)
     deallocate(tau_lw, planck_frac)
   end if
+  if (save_gpt_flux) then
+    call unblock_and_write(trim(nndev_file), 'gpt_flux_up', gpt_flux_up)
+    call unblock_and_write(trim(nndev_file), 'gpt_flux_dn', gpt_flux_dn)
+  end if
+
+  call unblock_and_write(trim(nndev_file), 'sfc_emis', sfc_emis)
+  call unblock_and_write(trim(nndev_file), 'sfc_temperature', sfc_t)
 
   print *, "Optical properties (RRTMGP output) were successfully saved. All done!"
 
@@ -601,5 +632,12 @@ program rrtmgp_rfmip_lw
     real(wp) :: mean3
     mean3 = sum(x) / size(x)
   end function mean_3d
+  
+  function mean_4d(x) result(mean4)
+    implicit none 
+    real(wp), dimension(:,:,:,:), intent(in) :: x
+    real(wp) :: mean4
+    mean4 = sum(x) / size(x)
+  end function mean_4d
 
 end program rrtmgp_rfmip_lw

@@ -2,11 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Train new shortwave gas-optics MLPs through the differentiable PyTorch
-shortwave radiation model, using spectral/g-point fluxes as the target.
-
-This script intentionally does not modify gpt_ml_load_save_preproc.py or
- gpt_torch_models_rad.py. It uses their existing load_rrtmgp(),
-load_gas_optics_from_file(), mlp_gasopt_inlined_processing, and SW_rad_torch.
+shortwave radiation model, using band-wise or broadband fluxes as the target.
+The user specifies the bands 
 
 The training target from load_rrtmgp(..., predictand="sw_gpt_fluxes") is assumed
 to be a tuple:
@@ -36,7 +33,11 @@ except ImportError:
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from torchinfo import summary
 
-from gpt_ml_load_save_preproc import load_rrtmgp
+from gpt_ml_load_save_preproc import (
+    load_CKDMIPstyle_data,
+    load_rrtmgp,
+    prepare_CKDMIP_style_data,
+)
 import gpt_torch_models_rad as radlib
 from gpt_torch_models_rad import (
     SW_rad_torch,
@@ -44,6 +45,46 @@ from gpt_torch_models_rad import (
     mlp_gasopt_inlined_processing,
 )
 from coefficients import RRTMGP_SPLITS#, WAVENUM_SPLITS
+
+
+CKDMIP_EXPERIMENTS = {
+    0: "Present day (PD)",
+    1: "Pre-industrial (PI) greenhouse gas concentrations",
+    2: "4xCO2",
+    3: "future",
+    4: "0.5xCO2",
+    5: "2xCO2",
+    6: "3xCO2",
+    7: "8xCO2",
+    8: "PI CO2",
+    9: "PI CH4",
+    10: "PI N2O",
+    11: "PI O3",
+    12: "PI HCs",
+    13: "+4K",
+    14: "+4K, const. RH",
+    15: "PI all",
+    16: "future-all",
+    17: "LGM",
+}
+
+# Experiment pairs are (perturbed, baseline), matching the requested
+# forcing-error convention: (true2 - true1) - (pred2 - pred1).
+CKDMIP_IRF_PAIRS = {
+    "future_minus_pi": (3, 1),
+    "ch4_pd_minus_pi": (0, 9),
+}
+
+CKDMIP_WANDB_METRICS = (
+    "ckdmip/mae_heating_rate_all",
+    "ckdmip/mae_heating_rate_present_day",
+    "ckdmip/mae_heating_rate_preindustrial",
+    "ckdmip/mae_heating_rate_future_all",
+    "ckdmip/bias_surface_downwelling_flux",
+    "ckdmip/bias_toa_irf_future_minus_pi",
+    "ckdmip/bias_surface_irf_future_minus_pi",
+    "ckdmip/bias_surface_irf_ch4_pd_minus_pi",
+)
 
 # train_on_bands=True 
 
@@ -404,6 +445,7 @@ def forward_fluxes(
     toa: torch.Tensor,
     pres: torch.Tensor,
     albedo: torch.Tensor,
+    printdebug=False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _, rsu_pred, rsd_pred, rsd_dir_pred = model(
         x,
@@ -413,6 +455,7 @@ def forward_fluxes(
         pres,
         albedo,
         albedo,
+        printdebug,
     )
     batch_size = x.shape[0]
     nlev = pres.shape[1]
@@ -541,6 +584,152 @@ def calc_heatingrate_torch(fluxup: torch.Tensor, fluxdn: torch.Tensor, pres_leve
     return (24 * 3600) * dTdt
 
 
+def load_ckdmip_validation_data(
+    input_norm_coeffs: Tuple[np.ndarray, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    """Load and preprocess the default CKDMIP/RFMIP validation files once."""
+    (
+        x_raw,
+        pres_level,
+        flux_up_true,
+        flux_dn_true,
+        expt_labels,
+        ckdmip_aux,
+    ) = load_CKDMIPstyle_data(return_aux=True)
+
+    if x_raw.shape[0] < len(CKDMIP_EXPERIMENTS):
+        raise ValueError(
+            f"Expected at least {len(CKDMIP_EXPERIMENTS)} CKDMIP experiments, "
+            f"got {x_raw.shape[0]}"
+        )
+
+    prepared = prepare_CKDMIP_style_data(
+        x_raw,
+        flux_up_true,
+        flux_dn_true,
+        # exp_index_pairs=list(CKDMIP_IRF_PAIRS.values()),
+        input_norm_coefficients=input_norm_coeffs,
+        pres_level=pres_level,
+        aux=ckdmip_aux,
+        # return_full=True,
+    )
+    prepared["expt_labels"] = expt_labels
+
+    print("Loaded CKDMIP validation data")
+    print(f"  experiments: {x_raw.shape[0]}, sites: {x_raw.shape[1]}, layers: {x_raw.shape[2]}")
+    print(f"  x shape: {prepared['x'].shape}")
+    print(f"  reference flux shape: {prepared['flux_up_true'].shape}")
+    return prepared
+
+
+def run_ckdmip_validation(
+    *,
+    model: SW_rad_torch,
+    ckdmip_data: Dict[str, np.ndarray],
+    device: torch.device,
+    batch_size: int,
+) -> Dict[str, float]:
+    """Evaluate the requested CKDMIP heating-rate, flux-bias and IRF metrics."""
+    model.eval()
+
+    x = np.asarray(ckdmip_data["x"])
+    nexpt, nsite, nlay, nx = x.shape
+    nprof = nexpt * nsite
+    nlev = nlay + 1
+
+    def _flat(name, trailing_shape):
+        arr = np.asarray(ckdmip_data[name])
+        return arr.reshape((nprof,) + trailing_shape)
+
+    x_flat = x.reshape(nprof, nlay, nx)
+    col_dry_flat = _flat("col_dry", (nlay,))
+    mu0_flat = _flat("mu0", ())
+    toa_flat = _flat("total_solar_irradiance", ())
+    pres_flat = _flat("pres_level", (nlev,))
+    albedo_flat = _flat("surface_albedo", ())
+
+    rsu_pred_parts = []
+    rsd_pred_parts = []
+    eval_batch_size = max(1, int(batch_size))
+
+    with torch.no_grad():
+        for start in range(0, nprof, eval_batch_size):
+            stop = min(start + eval_batch_size, nprof)
+            xb = torch.as_tensor(x_flat[start:stop], dtype=torch.float32, device=device)
+            colb = torch.as_tensor(col_dry_flat[start:stop], dtype=torch.float32, device=device)
+            mu0b = torch.as_tensor(mu0_flat[start:stop], dtype=torch.float32, device=device)
+            toab = torch.as_tensor(toa_flat[start:stop], dtype=torch.float32, device=device)
+            presb = torch.as_tensor(pres_flat[start:stop], dtype=torch.float32, device=device)
+            albedob = torch.as_tensor(albedo_flat[start:stop], dtype=torch.float32, device=device)
+
+            rsu_gpt, rsd_gpt, _ = forward_fluxes(
+                model, xb, colb, mu0b, toab, presb, albedob, printdebug=False
+            )
+            # CKDMIP has no reference rsd_dir. The model still returns it, but it
+            # is intentionally ignored here. Metrics use broadband rsu and rsd.
+            rsu_pred_parts.append(rsu_gpt.sum(dim=-1).cpu())
+            rsd_pred_parts.append(rsd_gpt.sum(dim=-1).cpu())
+
+    rsu_pred = torch.cat(rsu_pred_parts, dim=0).reshape(nexpt, nsite, nlev)
+    rsd_pred = torch.cat(rsd_pred_parts, dim=0).reshape(nexpt, nsite, nlev)
+    rsu_true = torch.as_tensor(ckdmip_data["flux_up_true"], dtype=torch.float32)
+    rsd_true = torch.as_tensor(ckdmip_data["flux_dn_true"], dtype=torch.float32)
+    pres = torch.as_tensor(ckdmip_data["pres_level"], dtype=torch.float32)
+
+    if rsu_true.shape != (nexpt, nsite, nlev) or rsd_true.shape != (nexpt, nsite, nlev):
+        raise ValueError(
+            "Expected CKDMIP reference fluxes to have shape "
+            f"({nexpt}, {nsite}, {nlev}); got rsu={tuple(rsu_true.shape)}, "
+            f"rsd={tuple(rsd_true.shape)}"
+        )
+
+    hr_pred = calc_heatingrate_torch(
+        rsu_pred.reshape(nprof, nlev),
+        rsd_pred.reshape(nprof, nlev),
+        pres.reshape(nprof, nlev),
+    ).reshape(nexpt, nsite, nlay)
+    hr_true = calc_heatingrate_torch(
+        rsu_true.reshape(nprof, nlev),
+        rsd_true.reshape(nprof, nlev),
+        pres.reshape(nprof, nlev),
+    ).reshape(nexpt, nsite, nlay)
+    hr_abs_error = torch.abs(hr_true - hr_pred)
+
+    # Determine surface/TOA from pressure rather than assuming level ordering.
+    # p_first = float(pres[..., 0].mean())
+    # p_last = float(pres[..., -1].mean())
+    # if p_first <= p_last:
+    toa_index, surface_index = 0, -1
+    # else:
+    #     toa_index, surface_index = -1, 0
+
+
+    surface_dn_bias = torch.mean(rsd_true[..., surface_index]) - torch.mean(rsd_pred[..., surface_index])
+
+    net_true = rsd_true - rsu_true
+    net_pred = rsd_pred - rsu_pred
+
+    def _irf_bias(iexp2: int, iexp1: int, ilev: int) -> torch.Tensor:
+        true_irf = net_true[iexp2, :, ilev] - net_true[iexp1, :, ilev]
+        pred_irf = net_pred[iexp2, :, ilev] - net_pred[iexp1, :, ilev]
+        return torch.mean(true_irf - pred_irf)
+
+    future, pi = CKDMIP_IRF_PAIRS["future_minus_pi"]
+    pd, pi_ch4 = CKDMIP_IRF_PAIRS["ch4_pd_minus_pi"]
+
+    metrics = {
+        "ckdmip/mae_heating_rate_all": float(hr_abs_error.mean()),
+        "ckdmip/mae_heating_rate_present_day": float(hr_abs_error[0].mean()),
+        "ckdmip/mae_heating_rate_preindustrial": float(hr_abs_error[1].mean()),
+        "ckdmip/mae_heating_rate_future_all": float(hr_abs_error[16].mean()),
+        "ckdmip/bias_surface_downwelling_flux": float(surface_dn_bias),
+        "ckdmip/bias_toa_irf_future_minus_pi": float(_irf_bias(future, pi, toa_index)),
+        "ckdmip/bias_surface_irf_future_minus_pi": float(_irf_bias(future, pi, surface_index)),
+        "ckdmip/bias_surface_irf_ch4_pd_minus_pi": float(_irf_bias(pd, pi_ch4, surface_index)),
+    }
+    return metrics
+
+
 def run_epoch(
     *,
     model: SW_rad_torch,
@@ -573,7 +762,7 @@ def run_epoch(
             if training:
                 optimizer.zero_grad(set_to_none=True)
 
-            y_pred_fluxes = forward_fluxes(model, x, col_dry, mu0, toa, pres, albedo)
+            y_pred_fluxes = forward_fluxes(model, x, col_dry, mu0, toa, pres, albedo, printdebug=False)
             # loss = flux_mse_loss(y_pred_fluxes, y_true_fluxes)
 
             # if band_weights is not None:
@@ -596,8 +785,12 @@ def run_epoch(
 
             rsu_p = y_pred_fluxes[0].detach().sum(dim=-1)
             rsd_p = y_pred_fluxes[1].detach().sum(dim=-1)
+
             rsu_t = y_true_fluxes[0].detach().sum(dim=-1)
             rsd_t = y_true_fluxes[1].detach().sum(dim=-1)
+
+            surface_dn_bias = torch.mean(rsd_t[..., -1]) - torch.mean(rsd_p[..., -1])
+            # print("rsd_sfc t ",rsd_t[..., -1].mean().item(), "p",  rsd_p[..., -1].mean().item())
 
             hr_p = calc_heatingrate_torch(rsu_p, rsd_p, pres.detach())
             hr_t = calc_heatingrate_torch(rsu_t, rsd_t, pres.detach())
@@ -642,6 +835,7 @@ def run_epoch(
         "hr_rmse": np.sqrt(total_hr_sse / max(total_hr_n, 1)),
         "rsu_pearson": _corr(pearson_stats["rsu"]),
         "rsd_pearson": _corr(pearson_stats["rsd"]),
+        "surface_dn_bias": float(surface_dn_bias),
     }
 
 
@@ -661,11 +855,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ng", type=int, default=16, help="Number of learned spectral/g-point channels in the new gas-optics models")
     parser.add_argument("--nh", type=int, default=32, help="Hidden neurons in each gas-optics MLP hidden layer")
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1.0e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--validate-on-ckdmip",
+        action="store_true",
+        help=(
+            "At the end of every epoch, evaluate the model on the default CKDMIP "
+            "dataset and log heating-rate, flux-bias and radiative-forcing metrics"
+        ),
+    )
     parser.add_argument("--patience", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--preload-gpu", action="store_true", help="Move the full dataset to GPU before training")
@@ -733,6 +935,10 @@ def main() -> None:
             project=args.wandb_project,
             config=vars(args),
         )
+        if args.validate_on_ckdmip:
+            wandb.define_metric("epoch")
+            for metric_name in CKDMIP_WANDB_METRICS:
+                wandb.define_metric(metric_name, step_metric="epoch")
 
     def _as_data_file_list(data_file_arg):
         """
@@ -773,6 +979,10 @@ def main() -> None:
 
     input_norm_coeffs = load_input_norm_coeffs(args.gasopt_abs_file, device)
     # xmin, xmax = input_norm_coeffs
+
+    ckdmip_data = None
+    if args.validate_on_ckdmip:
+        ckdmip_data = load_ckdmip_validation_data(input_norm_coeffs)
 
     for i, data_file in enumerate(data_files):
         x_i, y_ref_i, col_dry_i, aux_i, input_names_i, kdist_str_i = load_training_data(
@@ -942,6 +1152,15 @@ def main() -> None:
             monitor = train_metrics["rmse"]
             val_str = ""
 
+        ckdmip_metrics = None
+        if ckdmip_data is not None:
+            ckdmip_metrics = run_ckdmip_validation(
+                model=model,
+                ckdmip_data=ckdmip_data,
+                device=device,
+                batch_size=args.batch_size,
+            )
+
         print(
             f"Epoch {epoch:04d}/{args.epochs}"
             f" - train_rmse: {train_metrics['rmse']:.2f}"
@@ -951,6 +1170,18 @@ def main() -> None:
             f" - train_rsd_r: {train_metrics['rsd_pearson']:.5f}"
             f"{val_str}"
         )
+        if ckdmip_metrics is not None:
+            print(
+                "  CKDMIP"
+                f" - HR MAE all: {ckdmip_metrics['ckdmip/mae_heating_rate_all']:.4f}"
+                f" - PD: {ckdmip_metrics['ckdmip/mae_heating_rate_present_day']:.4f}"
+                f" - PI: {ckdmip_metrics['ckdmip/mae_heating_rate_preindustrial']:.4f}"
+                f" - future-all: {ckdmip_metrics['ckdmip/mae_heating_rate_future_all']:.4f}"
+                f" - sfc dn bias: {ckdmip_metrics['ckdmip/bias_surface_downwelling_flux']:.4f}"
+                f" - TOA IRF future-PI bias: {ckdmip_metrics['ckdmip/bias_toa_irf_future_minus_pi']:.4f}"
+                f" - sfc IRF future-PI bias: {ckdmip_metrics['ckdmip/bias_surface_irf_future_minus_pi']:.4f}"
+                f" - sfc IRF CH4 PD-PI bias: {ckdmip_metrics['ckdmip/bias_surface_irf_ch4_pd_minus_pi']:.4f}"
+            )
 
         if wandb_run is not None:
             wandb_metrics = {
@@ -972,8 +1203,11 @@ def main() -> None:
                         "val/hr_rmse": val_metrics["hr_rmse"],
                         "val/rsu_pearson": val_metrics["rsu_pearson"],
                         "val/rsd_pearson": val_metrics["rsd_pearson"],
+                        "val/bias_sfc_dn_flux": val_metrics["surface_dn_bias"],
                     }
                 )
+            if ckdmip_metrics is not None:
+                wandb_metrics.update(ckdmip_metrics)
             wandb_run.log(wandb_metrics, step=epoch)
 
         if monitor < best_val:

@@ -6,7 +6,7 @@ scheme, the RTE radiative transfer solver, or their combination RTE+RRTMGP (a
 radiative transfer scheme).
 
 This file provides functions for loading and preprocessing data so that it
-may be used for training e.g. a neural network version of RRTMGP
+may be used for training and evaluating NN gas optics
 
 @author: Peter Ukkonen
 """
@@ -20,6 +20,260 @@ import sys
 import numpy as np
 from numba import jit, njit, prange
 from netCDF4 import Dataset
+
+def _flatten_expt_site(arr):
+    new_shape = (arr.shape[0] * arr.shape[1],) + arr.shape[2:]
+    flattened_arr = arr.reshape(new_shape)
+    return flattened_arr 
+
+def load_CKDMIPstyle_data(
+    fpath_input="../rfmip-clear-sky/multiple_input4MIPs_radiation_RFMIP_UColorado-RFMIP-1-2_none.nc",
+    fpath_output_sw="../rfmip-clear-sky/output_fluxes/rsud_Efx_LBLRTM-12-8_rad-irf_r1i1p1f1_gn.nc",
+    fpath_output_lw="../rfmip-clear-sky/output_fluxes/rlud_Efx_LBLRTM-12-8_rad-irf_r1i1p1f1_gn.nc",
+    fpath_output=None,
+    shortwave=True, # longwave not yet implemented
+    return_aux=False,
+):
+    """
+    Load CKDMIP-style data from NetCDF files containing gas concentrations as separate variables,
+    and prepare NN gas optics input array from this. 
+    Also load corresponding reference fluxes (may come from LBL or RRTMGP).
+    Data in these files has the dimension structure (expt, site, level) but inputs may also be provided as
+    (expt, site) or (expt), which is often the case for gases that are assumed to be well-mixed: concentrations
+    only vary by experiment. 
+    Depending on the shape of the individual feature variables, they are repeated to (nexpt,ncol,nlev) and then
+    concatenated along the feature dim
+
+    Returns:
+        x, pres_level, flux_up_true, flux_dn_true, expt_labels
+
+        If return_aux=True, a sixth return value is added containing the
+        shortwave radiation inputs that do not live in x:
+        mu0, total_solar_irradiance, surface_albedo and profile_weight.
+
+    where:
+        x               = raw gas-optics inputs, shape (nexpt, ncol, nlev, nx) where nx depends on whether shortwave is True
+        flux_up_true    = reference upwelling fluxes (nexpt, ncol, nlev+1)
+        flux_dn_true    = reference downwelling fluxes (nexpt, ncol, nlev+1)
+        pres_level      = pressure at half-levels (nexpt, ncol, nlev+1), needed for computing heating rates
+    """
+    if fpath_output is None:
+      fpath_output=fpath_output_sw if shortwave else fpath_output_lw
+    # print("sw:", shortwave, "fpath", fpath_output)
+    data_input = Dataset(fpath_input)
+    data_output = Dataset(fpath_output)
+
+    # NetCDF input file has a string array variable of experiment names:
+    expt_labels = [str(label) for label in data_input.variables["expt_label"][:]]
+
+    def _get_var(dat, name):
+        try:
+            return dat.variables[name][:].data, name
+        except Exception:
+            # raise KeyError(f"variable {name} not found in file, trying with _GM suffix")
+            name_gm = name + "_GM"
+            # Some gases will only have nexpt dimension, in which case they have the "_GM" suffix
+            try:
+              return dat.variables[name_gm][:].data, name
+            except Exception:
+              raise KeyError(f"variable {name} nor {name_gm} not found in file")
+        return None, None
+
+    nsite = data_input.dimensions["site"].size
+    nexpt = data_input.dimensions["expt"].size
+    nlay = data_input.dimensions["layer"].size
+    nlev = nlay + 1
+
+    if shortwave:
+      # print(data_output.variables)
+      print("loading rsu")
+      flux_up_true,_ = _get_var(data_output, "rsu")
+      print("loading rsd")
+      flux_dn_true,_ = _get_var(data_output, "rsd")
+      # flux_dn_dir_true,_ = _get_var(data_output, "rsd_dir")
+      # print("flux up shape", flux_up_true.shape, "dtype", flux_up_true.dtype)
+      input_names =  ["tlay", "play", "h2o", "o3", "co2", "n2o", "ch4"]
+      input_names_data = [
+          "temp_layer",
+          "pres_layer",
+          "water_vapor",
+          "ozone",
+          "carbon_dioxide",
+          "nitrous_oxide",
+          "methane",
+      ]
+    # else:
+    #     flux_up_true = _get_var(data_output, ["rlu"])
+    #     flux_dn_true = _get_var(data_output, ["rld"])
+    #     input_names =  ["tlay", "play", "h2o", "o3", "co2", "n2o", "ch4","cfc11","cfc12"]     
+    nx = len(input_names)
+    x = np.zeros((nexpt,nsite,nlay,nx),dtype=flux_up_true.dtype)
+    print(x.shape)
+    # print(data_input.variables)
+    print("nlay", nlay, "nlev", nlev, "nsite", nsite, "nexpt", nexpt)
+    pres_level = data_input.variables["pres_level"][:].data
+    # repeat pres_level into (nexpt, nlev, nsite)
+    pres_level = np.repeat(pres_level[np.newaxis,:,:], nexpt, axis=0)
+    # print(pres_level.shape)
+    index = 0
+    for input_name in input_names_data:
+      if input_name=="carbon_dioxide":
+        scaling = 1e-6
+      elif input_name=="nitrous_oxide":
+        scaling = 1e-6
+      elif input_name=="methane":
+        scaling = 1e-9 
+      else:
+        scaling = 1.0
+      inp_var, _ = _get_var(data_input,input_name)
+      print(input_name, inp_var.shape)
+      ndims = len(inp_var.shape)
+      inp_var = scaling*inp_var 
+      # Append inp_var to x - it can already have the required (nexpt,ncol,nlev), or its (nexpt) or (ncol,nlev)
+      # Depending on the shape of the individual feature variables, the data is broadcasted
+      if ndims == 3:
+        x[:,:,:,index] = inp_var
+      elif ndims == 2: # (ncol, nlev) to (nexpt, ncol, nlev)
+        x[:,:,:,index] = np.repeat(inp_var[np.newaxis,:,:],nexpt,axis=0)
+      elif ndims == 1: # broadcast one value per experiment over sites and layers
+          if inp_var.shape[0] != nexpt:
+              raise ValueError(
+                      f"Expected {input_name} to have length {nexpt}, "
+                      f"got {inp_var.shape[0]}"
+              )
+          x[:,:,:,index] = np.broadcast_to(
+                  inp_var[:, np.newaxis, np.newaxis], (nexpt, nsite, nlay)
+          )
+      else:
+        raise ValueError(f"Unexpected number of dimensions {ndims} for variable {input_name}")
+    # nx = x.shape[-1]
+      index = index + 1
+    print("Final x shape", x.shape)
+    # Debug that broadcasting was successful
+    for i in range(nx):
+      print(f"Feature {input_names[i]}: min {x[:,:,:,i].min()}, max {x[:,:,:,i].max()}")
+    # input x and output fluxes now have shape (nexpt, nsite, ..)
+    if return_aux:
+      solar_zenith_angle = data_input.variables["solar_zenith_angle"][:].data
+      mu0 = np.clip(np.cos(np.deg2rad(solar_zenith_angle)), 0.0, 1.0)
+      total_solar_irradiance = data_input.variables["total_solar_irradiance"][:].data
+      surface_albedo = data_input.variables["surface_albedo"][:].data
+      if "profile_weight" in data_input.variables:
+        profile_weight = data_input.variables["profile_weight"][:].data
+      else:
+        profile_weight = np.ones(nsite, dtype=x.dtype)
+
+      aux = {
+          "mu0": np.asarray(mu0),
+          "total_solar_irradiance": np.asarray(total_solar_irradiance),
+          "surface_albedo": np.asarray(surface_albedo),
+          "profile_weight": np.asarray(profile_weight),
+      }
+      data_input.close()
+      data_output.close()
+      return x, pres_level, flux_up_true, flux_dn_true, expt_labels, aux
+
+    data_input.close()
+    data_output.close()
+    return x, pres_level, flux_up_true, flux_dn_true, expt_labels
+
+def prepare_CKDMIP_style_data(
+        x_raw, # inputs, not yet normalized(nexpt, nsite, nlev, nx)
+        flux_up_true, flux_dn_true, # true fluxes(nexpt, nsite, nlev+1)
+        # exp_index_pairs: List[Tuple[int,int]], # list of tuples of experiment indices to use for evaluation
+        input_norm_coefficients,
+        pres_level=None,
+        aux=None,
+        return_full=False,
+        ):
+    """
+    Prepare CKDMIP-style data for evaluating the radiative forcings of NN gas optics models.
+
+    """
+    x_raw = np.asarray(x_raw)
+    flux_up_true = np.asarray(flux_up_true)
+    flux_dn_true = np.asarray(flux_dn_true)
+    nx = x_raw.shape[-1]
+    nexpt, nsite, nlay, _ = x_raw.shape
+
+    x = preproc_minmax_inputs_rrtmgp(
+        x_raw.reshape(-1, nx), input_norm_coefficients
+    ).reshape(x_raw.shape)
+
+    # x_experiment_pairs, flux_up_experiment_pairs, flux_dn_experiment_pairs = [], [], []
+    # for iexp2, iexp1 in exp_index_pairs:
+    #     x_experiment_pairs.append((x[iexp2], x[iexp1]))
+    #     flux_up_experiment_pairs.append((flux_up_true[iexp2], flux_up_true[iexp1]))
+    #     flux_dn_experiment_pairs.append((flux_dn_true[iexp2], flux_dn_true[iexp1]))
+
+    # if not return_full:
+    #     return x_experiment_pairs, flux_up_experiment_pairs, flux_dn_experiment_pairs
+
+    prepared = {
+        "x": np.asarray(x),
+        "flux_up_true": flux_up_true,
+        "flux_dn_true": flux_dn_true,
+        # "exp_index_pairs": list(exp_index_pairs),
+        # "x_experiment_pairs": x_experiment_pairs,
+        # "flux_up_experiment_pairs": flux_up_experiment_pairs,
+        # "flux_dn_experiment_pairs": flux_dn_experiment_pairs,
+    }
+
+    if pres_level is not None:
+        pres_level = np.asarray(pres_level)
+        if pres_level.shape[0:2] != (nexpt, nsite):
+            raise ValueError(
+                "Expected CKDMIP pres_level to start with (nexpt, nsite)="
+                f"({nexpt}, {nsite}), got {pres_level.shape}"
+            )
+        if pres_level.shape[-1] != nlay + 1:
+            raise ValueError(
+                f"Expected {nlay + 1} pressure levels for {nlay} layers, "
+                f"got {pres_level.shape[-1]}"
+            )
+        prepared["pres_level"] = pres_level
+
+        # H2O is feature index 2 in the RRTMGP SW gas-optics input ordering.
+        vmr_h2o = x_raw[..., 2]
+        col_dry = get_col_dry(
+            vmr_h2o.reshape(-1, nlay),
+            pres_level.reshape(-1, nlay + 1),
+        ).reshape(nexpt, nsite, nlay)
+        prepared["col_dry"] = col_dry
+
+    if aux is not None:
+        def _broadcast_expt_site(value, name):
+            value = np.asarray(value)
+            if value.shape == (nsite,):
+                return np.broadcast_to(value[np.newaxis, :], (nexpt, nsite)).copy()
+            if value.shape == (nexpt, nsite):
+                return value
+            if value.ndim == 0:
+                return np.full((nexpt, nsite), value, dtype=value.dtype)
+            raise ValueError(
+                f"Expected CKDMIP {name} to have shape ({nsite},) or "
+                f"({nexpt}, {nsite}), got {value.shape}"
+            )
+
+        for name in ("mu0", "total_solar_irradiance", "surface_albedo", "profile_weight"):
+            if name in aux:
+                prepared[name] = _broadcast_expt_site(aux[name], name)
+
+    required = (
+        "pres_level",
+        "col_dry",
+        "mu0",
+        "total_solar_irradiance",
+        "surface_albedo",
+    )
+    missing = [name for name in required if name not in prepared]
+    if missing:
+        raise ValueError(
+            "return_full=True requires pres_level and CKDMIP radiation auxiliary "
+            f"inputs; missing {missing}"
+        )
+
+    return prepared
 
 def load_rrtmgp(
     fname,
@@ -70,11 +324,6 @@ def load_rrtmgp(
             input_names = None
         return input_names
 
-    def _flatten_expt_site(arr):
-        new_shape = (arr.shape[0] * arr.shape[1],) + arr.shape[2:]
-        flattened_arr = arr.reshape(new_shape)
-        return flattened_arr 
-
     # k-distribution info
     try:
         kdist_str = dat.comment
@@ -94,6 +343,9 @@ def load_rrtmgp(
         nx = x.shape[-1]
         
         x = _flatten_expt_site(x)
+
+        for i in range(nx):
+          print(f"load_rrtmgp x {input_names[i]}: min {x[:,:,i].min()}, max {x[:,:,i].max()}")
 
         col_dry, _ = _get_var(['col_dry'])
         pres_level, _ = _get_var(['pres_level', 'plev', 'pressure_level'])

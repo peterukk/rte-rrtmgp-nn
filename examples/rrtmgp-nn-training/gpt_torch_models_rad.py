@@ -97,6 +97,38 @@ def rrtmgp_bounds_to_wavenum_bounds(rrtmgp_band_bounds):
             wavenum_bounds.append(RRTMGP_WAVENUM_LOW[band_idx])
     return wavenum_bounds
 
+def make_band_coordinate_vectors(band_bounds, ng, device=None, dtype=torch.float32):
+    """
+    Returns:
+        band_index: shape (ng,), integer band index for each g-point
+        band_coord: shape (ng,), coordinate from 0 to 1 within each band
+    """
+    band_index = torch.empty(ng, device=device, dtype=torch.long)
+    band_coord = torch.empty(ng, device=device, dtype=dtype)
+
+    for iband in range(len(band_bounds) - 1):
+        i0 = int(band_bounds[iband])
+        i1 = int(band_bounds[iband + 1])
+        n = i1 - i0
+
+        if n <= 0:
+            raise ValueError(f"Bad band_bounds: {band_bounds}")
+
+        band_index[i0:i1] = iband
+
+        if n == 1:
+            band_coord[i0:i1] = 1.0
+        else:
+            band_coord[i0:i1] = torch.linspace(
+                0.0,
+                1.0,
+                n,
+                device=device,
+                dtype=dtype,
+            )
+
+    return band_index, band_coord
+
 class mlp_gasopt_inlined_processing(nn.Module):
     """
     Gas optics neural networks: differs from GasOpticsMLP in that the post-processing is inlined.
@@ -108,6 +140,8 @@ class mlp_gasopt_inlined_processing(nn.Module):
     lock_weights: Final[bool]
     do_norm: Final[bool]
     is_rrtmgp: Final[bool]
+    monotonic_prior: Final[bool]
+    # extra_layer: Final[bool]
     def __init__(self, device, 
                 xmin, xmax, ymean=None, ystd=None,
                 nn_w1=None, nn_w2=None, nn_w3=None,
@@ -122,6 +156,7 @@ class mlp_gasopt_inlined_processing(nn.Module):
         super(mlp_gasopt_inlined_processing, self).__init__()
         self.nx = xmin.shape[0]
         self.do_norm = False
+        self.monotonic_prior=False
         if ymean is not None:
           self.ny = ymean.shape[0]
           self.ng = self.ny
@@ -194,7 +229,21 @@ class mlp_gasopt_inlined_processing(nn.Module):
                   f"(vis fraction={self.vis_transition_fraction:.3f}), "
                   f"visible: {self.i_gpt_vis_start}:{self.ng}")
     
-    
+            if self.monotonic_prior:
+                band_index, band_coord = make_band_coordinate_vectors(
+                    self.band_bounds,
+                    ng=self.ng,
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+                self.register_buffer("band_index", band_index)
+                self.register_buffer("band_coord", band_coord.reshape(1, 1, self.ng))
+
+                # One learned steepness per band.
+                # raw parameter is unconstrained; softplus makes steepness positive.
+                self.band_log_slope = nn.Parameter(torch.zeros(self.num_bands))
+
         print("do norm", do_norm)
         if nn_w1 is not None:
           self.nh = nn_w1.shape[1]
@@ -242,6 +291,9 @@ class mlp_gasopt_inlined_processing(nn.Module):
         x = self.mlp2(x)
         x = self.softsign(x)
         x = self.mlp3(x)
+        if self.monotonic_prior:
+            x = x * self.get_monotonic_shape_factor()
+        # print("mono" ,  self.get_monotonic_shape_factor())
         tau = x 
         # print("x shape", x.shape, "coldry", col_dry.shape, "ystd",self.ystd.shape)
         # Postprocessing inlined: reverse standard scaling and square root scaling, multiply with number of dry air molecules
@@ -251,7 +303,40 @@ class mlp_gasopt_inlined_processing(nn.Module):
           tau = col_dry * torch.pow(tau,8)
           # print("mean tau after coldry, pow8", tau.mean().item())
         coeff=1e-17
+        coeff=1e-16
         return tau*coeff
+
+    def get_monotonic_shape_factor(self):
+        """
+        Returns shape factor of shape (1, 1, ng), increasing within each band.
+
+        Each band has its own learned exponential steepness.
+        The factor is normalized so the mean within each band is ~1, avoiding
+        a strong change in overall optical-depth scale.
+        """
+        if self.band_bounds is None:
+            return 1.0
+
+        # Positive steepness per band
+        slope_per_band = torch.nn.functional.softplus(self.band_log_slope)
+
+        # Map each g-point to its band's slope
+        slope_g = slope_per_band[self.band_index].reshape(1, 1, self.ng)
+
+        # Exponential ramp within each band
+        shape = torch.exp(slope_g * self.band_coord)
+
+        # Normalize each band so mean factor in that band is 1.
+        pieces = []
+        for iband in range(self.num_bands):
+            i0 = self.band_bounds[iband]
+            i1 = self.band_bounds[iband + 1]
+
+            s = shape[..., i0:i1]
+            s = s / s.mean(dim=-1, keepdim=True)
+            pieces.append(s)
+
+        return torch.cat(pieces, dim=-1)
 
     def get_solar_weights(self):
         if self.is_rrtmgp:
@@ -279,6 +364,54 @@ class mlp_gasopt_inlined_processing(nn.Module):
             # print("shape band weights", band_weights.shape)
             return band_weights.unsqueeze(0)  # (1, ng) matching RRTMGP format
         return solar_weights
+
+    # def get_solar_weights(self):
+    #     if self.is_rrtmgp:
+    #         return self.sw_solar_weights
+    #     else:
+    #         raw = self.sw_solar_weights.reshape(-1)   # (ng,)
+            
+    #         # Compute target band fractions from RRTMGP solar source
+    #         rrtmgp_src = self.rrtmgp_sw_solar_weights.reshape(-1)
+    #         total = rrtmgp_src.sum()
+    #         bounds_ref = self.rrtmgp_bounds   # [0, 29, 80, 89, 102, 112]
+    #         bounds_ng  = self.band_bounds     # [0, 4, 11, 13, 15, 16]
+    #         nband = self.num_bands
+            
+    #         p_b = torch.stack([
+    #             rrtmgp_src[bounds_ref[b]:bounds_ref[b+1]].sum() / total
+    #             for b in range(nband)
+    #         ])   # (nband,) target fraction per band
+
+    #         band_weights = torch.cat([
+    #             self._monotone_band_weights(
+    #                 raw[bounds_ng[b]:bounds_ng[b+1]],
+    #                 p_b[b]
+    #             )
+    #             for b in range(nband)
+    #         ], dim=0)
+
+    #         return band_weights.unsqueeze(0)   # (1, ng)
+
+    # def _monotone_band_weights(self, raw_band: torch.Tensor, p_b: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     Given raw unconstrained parameters for one band, return monotonically
+    #     increasing weights that sum to p_b.
+
+    #     Strategy: softmax over cumulative sums of softplus-transformed raw values.
+    #     softplus ensures positive increments → cumsum gives monotone sequence →
+    #     softmax normalises → scale by p_b.
+    #     """
+    #     if raw_band.shape[0] == 1:
+    #         return p_b.unsqueeze(0)   # trivial single-g-point band
+
+    #     # softplus ensures increments are strictly positive
+    #     increments = torch.nn.functional.softplus(raw_band)   # (n,) all positive
+    #     # cumsum gives a monotonically increasing sequence
+    #     mono = torch.cumsum(increments, dim=0)                # (n,) monotone increasing
+    #     # softmax normalises to sum=1 within band
+    #     weights = torch.softmax(mono, dim=0)                  # (n,) sums to 1
+    #     return weights * p_b                                  # scale to band fraction
 
 class SW_rad_torch(nn.Module):
     """
@@ -337,9 +470,10 @@ class SW_rad_torch(nn.Module):
     def forward(self, x_gas, # inputs to gas optics NN model, already normalised
                 col_dry, mu0, incoming_toa, pres_lev, # unnormalised variables used in radiative transfer computations 
                 albedo_surf_dir_sw, # If albedo_surf_diff_sw is None, this is general albedo used for both dir and diff
-                albedo_surf_diff_sw=None):
+                albedo_surf_diff_sw=None,
+                printdebug=False):
 
-        printdebug = False 
+        # printdebug = False 
 
         batch_size, nlay, nx = x_gas.shape 
         nlev = nlay + 1 
@@ -359,6 +493,9 @@ class SW_rad_torch(nn.Module):
         # GAS OPTICAL PROPERTIES IN EACH LAYER
         # x_gas = torch.cat((temp, pres, vmr_h2o, o3, co2, n2o, ch4), dim=2)
         # x_gas = (x_gas - self.gas_optics_model_sw_abs.xmin) / self.gas_optics_model_sw_abs.div
+        if printdebug:
+          for ix in range(nx):
+            print("gas i", ix, "min", x_gas[:,:,ix].min().item(), "max", x_gas[:,:,ix].max().item())
 
         if self.is_rrtmgp:
           tau_sw      = self.gas_optics_model_sw_abs(x_gas, col_dry)
