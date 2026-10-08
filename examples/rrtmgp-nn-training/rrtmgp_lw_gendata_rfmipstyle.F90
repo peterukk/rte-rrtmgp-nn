@@ -388,6 +388,8 @@ program rrtmgp_rfmip_lw
                             fluxes,          &
                             n_gauss_angles = n_quad_angles, use_2stream = .false.) )
 
+    ! print *, "max gpt flux up", maxval(fluxes%gpt_flux_up)
+    ! print *, "max gpt flux up 2", maxval(gpt_flux_up(:,:,:,b)) 
   end do ! blocks
 
 #ifdef USE_OPENMP
@@ -434,11 +436,11 @@ program rrtmgp_rfmip_lw
   call nndev_file_netcdf%define_dimension("bnd", nbnd)
 
   ! RTE inputs and outputs (broadband fluxes), always saved (may not be needed, but take up little space)
-  call nndev_file_netcdf%define_variable("rsu", &
+  call nndev_file_netcdf%define_variable("rlu", &
   &   dim3_name="expt", dim2_name="site", dim1_name="level", &
   &   long_name="upwelling longwave flux")
 
-  call nndev_file_netcdf%define_variable("rsd", &
+  call nndev_file_netcdf%define_variable("rld", &
   &   dim3_name="expt", dim2_name="site", dim1_name="level", &
   &   long_name="downwelling longwave flux")
 
@@ -474,6 +476,10 @@ program rrtmgp_rfmip_lw
   &   dim3_name="expt", dim2_name="site", dim1_name="layer", &
   &   long_name="layer number of dry air molecules")
 
+  call nndev_file_netcdf%define_variable("temp_level", &
+  &   dim3_name="expt", dim2_name="site", dim1_name="level", &
+  &   long_name="temperature at layer edge")
+
   call nndev_file_netcdf%define_variable("sfc_emis", &
     &   dim2_name="expt", dim1_name="site", &
     &   long_name="surface emissivity (broadband)")
@@ -500,8 +506,8 @@ program rrtmgp_rfmip_lw
 
   call unblock_and_write(trim(nndev_file), 'pres_level', p_lev)
 
-  call unblock_and_write(trim(nndev_file), 'rsu', flux_up)
-  call unblock_and_write(trim(nndev_file), 'rsd', flux_dn)
+  call unblock_and_write(trim(nndev_file), 'rlu', flux_up)
+  call unblock_and_write(trim(nndev_file), 'rld', flux_dn)
 
   call unblock_and_write(trim(nndev_file), 'rrtmgp_lw_input',nn_gasopt_input)
   deallocate(nn_gasopt_input)
@@ -510,6 +516,8 @@ program rrtmgp_rfmip_lw
   ! print *," min max col dry", minval(col_dry), maxval(col_dry)
   call unblock_and_write(trim(nndev_file), 'col_dry', col_dry)
   deallocate(col_dry)
+  call unblock_and_write(trim(nndev_file), 'temp_level', t_lev)
+
   if (save_input_vectors) then
     call unblock_and_write(trim(nndev_file), 'tau_lw_gas', tau_lw)
     call unblock_and_write(trim(nndev_file), 'planck_fraction', planck_frac)

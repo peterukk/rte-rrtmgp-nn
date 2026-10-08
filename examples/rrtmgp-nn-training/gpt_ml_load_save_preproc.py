@@ -26,7 +26,7 @@ def _flatten_expt_site(arr):
     flattened_arr = arr.reshape(new_shape)
     return flattened_arr 
 
-def load_CKDMIPstyle_data(
+def load_RFMIP_data(
     fpath_input="../rfmip-clear-sky/multiple_input4MIPs_radiation_RFMIP_UColorado-RFMIP-1-2_none.nc",
     fpath_output_sw="../rfmip-clear-sky/output_fluxes/rsud_Efx_LBLRTM-12-8_rad-irf_r1i1p1f1_gn.nc",
     fpath_output_lw="../rfmip-clear-sky/output_fluxes/rlud_Efx_LBLRTM-12-8_rad-irf_r1i1p1f1_gn.nc",
@@ -35,7 +35,7 @@ def load_CKDMIPstyle_data(
     return_aux=False,
 ):
     """
-    Load CKDMIP-style data from NetCDF files containing gas concentrations as separate variables,
+    Load RFMIP data from NetCDF files containing gas concentrations as separate variables,
     and prepare NN gas optics input array from this. 
     Also load corresponding reference fluxes (may come from LBL or RRTMGP).
     Data in these files has the dimension structure (expt, site, level) but inputs may also be provided as
@@ -94,18 +94,27 @@ def load_CKDMIPstyle_data(
       # print("flux up shape", flux_up_true.shape, "dtype", flux_up_true.dtype)
       input_names =  ["tlay", "play", "h2o", "o3", "co2", "n2o", "ch4"]
       input_names_data = [
-          "temp_layer",
-          "pres_layer",
-          "water_vapor",
-          "ozone",
-          "carbon_dioxide",
-          "nitrous_oxide",
-          "methane",
+          "temp_layer", "pres_layer", "water_vapor", "ozone", "carbon_dioxide", "nitrous_oxide","methane",
       ]
-    # else:
-    #     flux_up_true = _get_var(data_output, ["rlu"])
-    #     flux_dn_true = _get_var(data_output, ["rld"])
-    #     input_names =  ["tlay", "play", "h2o", "o3", "co2", "n2o", "ch4","cfc11","cfc12"]     
+    else:
+        flux_up_true = _get_var(data_output, ["rlu"])
+        flux_dn_true = _get_var(data_output, ["rld"])
+        input_names = ["tlay", "play", "h2o", "o3", "co2", "ch4", "n2o", 
+                        "cfc11", "cfc12", "co", "ccl4", 
+                        "cfc22", "hfc143a", "hfc125", 
+                        "hfc23", "hfc32", "hfc134a", "cf4"]
+        input_names_data = ["temp_layer", "pres_layer", "water_vapor", "ozone", "carbon_dioxide", "methane", "nitrous_oxide",
+                            "cfc11", "cfc12", "carbon_monoxide", "carbon_tetrachloride", 
+                            "hcfc22", "hfc143a", "hfc125",
+                            "hfc23", "hfc32", "hfc134a", "cf4"]
+                            
+    scaling_values = {"carbon_dioxide": 1e-6,
+                "nitrous_oxide": 1e-9,
+                "methane": 1e-9,
+                "carbon_tetrachloride": 1e-12,
+                "cf4": 1e-12,
+                "cfc11": 1e-12, "cfc12": 1e-12, "hcfc22": 1e-12, "hfc125": 1e-12, "hfc134a": 1e-12, "hfc143a": 1e-12, "hfc23": 1e-12, "hfc32": 1e-12,
+                }
     nx = len(input_names)
     x = np.zeros((nexpt,nsite,nlay,nx),dtype=flux_up_true.dtype)
     print(x.shape)
@@ -117,16 +126,12 @@ def load_CKDMIPstyle_data(
     # print(pres_level.shape)
     index = 0
     for input_name in input_names_data:
-      if input_name=="carbon_dioxide":
-        scaling = 1e-6
-      elif input_name=="nitrous_oxide":
-        scaling = 1e-6
-      elif input_name=="methane":
-        scaling = 1e-9 
+      if input_name in scaling_values:
+        scaling = scaling_values[input_name]
       else:
         scaling = 1.0
       inp_var, _ = _get_var(data_input,input_name)
-      print(input_name, inp_var.shape)
+      print(input_name, inp_var.shape, "scaling:", scaling)
       ndims = len(inp_var.shape)
       inp_var = scaling*inp_var 
       # Append inp_var to x - it can already have the required (nexpt,ncol,nlev), or its (nexpt) or (ncol,nlev)
@@ -177,7 +182,7 @@ def load_CKDMIPstyle_data(
     data_output.close()
     return x, pres_level, flux_up_true, flux_dn_true, expt_labels
 
-def prepare_CKDMIP_style_data(
+def prepare_RFMIP_data(
         x_raw, # inputs, not yet normalized(nexpt, nsite, nlev, nx)
         flux_up_true, flux_dn_true, # true fluxes(nexpt, nsite, nlev+1)
         # exp_index_pairs: List[Tuple[int,int]], # list of tuples of experiment indices to use for evaluation
@@ -187,7 +192,7 @@ def prepare_CKDMIP_style_data(
         return_full=False,
         ):
     """
-    Prepare CKDMIP-style data for evaluating the radiative forcings of NN gas optics models.
+    Prepare RFMIP data for evaluating the radiative forcings of NN gas optics models.
 
     """
     x_raw = np.asarray(x_raw)
@@ -223,7 +228,7 @@ def prepare_CKDMIP_style_data(
         pres_level = np.asarray(pres_level)
         if pres_level.shape[0:2] != (nexpt, nsite):
             raise ValueError(
-                "Expected CKDMIP pres_level to start with (nexpt, nsite)="
+                "Expected RFMIP pres_level to start with (nexpt, nsite)="
                 f"({nexpt}, {nsite}), got {pres_level.shape}"
             )
         if pres_level.shape[-1] != nlay + 1:
@@ -251,7 +256,7 @@ def prepare_CKDMIP_style_data(
             if value.ndim == 0:
                 return np.full((nexpt, nsite), value, dtype=value.dtype)
             raise ValueError(
-                f"Expected CKDMIP {name} to have shape ({nsite},) or "
+                f"Expected RFMIP {name} to have shape ({nsite},) or "
                 f"({nexpt}, {nsite}), got {value.shape}"
             )
 
@@ -269,7 +274,7 @@ def prepare_CKDMIP_style_data(
     missing = [name for name in required if name not in prepared]
     if missing:
         raise ValueError(
-            "return_full=True requires pres_level and CKDMIP radiation auxiliary "
+            "return_full=True requires pres_level and RFMIP radiation auxiliary "
             f"inputs; missing {missing}"
         )
 
@@ -286,22 +291,27 @@ def load_rrtmgp(
     input_norm_coefficients=None, # Existing input normalisation coefficients can be provided
 ):
     """
-    Load RRTMGP-style data from NetCDF.
+    Load RRTMGP data from NetCDF.
 
     Default behaviour matches the original training script and returns:
         x, y, col_dry, input_names, kdist_str
 
-    If load_fluxes=True (or predictand is in ['sw_fluxes','sw_gpt_fluxes'), we want to train on 
-    FLUXES instead: load shortwave flux data instead. In that mode this function returns:
+    If load_fluxes=True (or predictand is a SW/LW flux predictand), this
+    function returns:
         x, y_ref, col_dry, input_names, kdist_str, aux
 
-    where:
-        x       = normalized shortwave gas-optics inputs, shape (nobs, nlay, nx)
-        y_ref   = stacked reference fluxes [rsu, rsd, rsd_dir], where each has shape (nobs, nlev) or (nobs, nlev, ng)
-        col_dry = dry-air column molecules, shape (nobs, nlay)
-        aux     = dict containing unscaled variables used by the radiation model
-                  (mu0, total_solar_irradiance, surface_albedo, pres_level)
+    Shortwave flux modes:
+        predictand='sw_fluxes'      -> y_ref=(rsu, rsd, rsd_dir)
+        predictand='sw_gpt_fluxes'  -> spectral equivalents
+
+    Longwave flux modes:
+        predictand='lw_fluxes'      -> y_ref=(rlu, rld)
+        predictand='lw_gpt_fluxes'  -> y_ref=(gpt_flux_up, gpt_flux_dn)
+
+    For longwave, aux additionally contains the unnormalised inputs required by
+    LW_rad_torch: temp_level, sfc_temperature, sfc_emis and pres_level.
     """
+    print("load_rrtmgp fname", fname)
     dat = Dataset(fname)
 
     def _get_var(names, required=True):
@@ -324,6 +334,21 @@ def load_rrtmgp(
             input_names = None
         return input_names
 
+    def _flatten_or_broadcast_expt_site(arr, nexp, nsite, name):
+        """Return array with expt/site collapsed into the leading dimension."""
+        arr = np.asarray(arr)
+        if arr.ndim >= 2 and arr.shape[0] == nexp and arr.shape[1] == nsite:
+            return _flatten_expt_site(arr)
+        if arr.ndim >= 1 and arr.shape[0] == nsite:
+            arr = np.broadcast_to(arr[np.newaxis, ...], (nexp,) + arr.shape)
+            return _flatten_expt_site(arr)
+        if arr.ndim == 0:
+            return np.full((nexp * nsite,), arr, dtype=arr.dtype)
+        raise ValueError(
+            f"Could not interpret {name} with shape {arr.shape}; expected leading "
+            f"dimensions (expt, site)=({nexp}, {nsite}) or site={nsite}."
+        )
+
     # k-distribution info
     try:
         kdist_str = dat.comment
@@ -334,37 +359,41 @@ def load_rrtmgp(
     except Exception:
         kdist_str = None
 
-    flux_mode = load_fluxes or predictand in ['sw_fluxes', 'sw_gpt_fluxes', 'sw_radiation']
+    sw_flux_predictands = ['sw_fluxes', 'sw_gpt_fluxes', 'sw_radiation']
+    lw_flux_predictands = ['lw_fluxes', 'lw_gpt_fluxes', 'lw_radiation']
+    flux_mode = load_fluxes or predictand in sw_flux_predictands + lw_flux_predictands
 
     if flux_mode:
-        xname = 'rrtmgp_sw_input'
-        x = dat.variables[xname][:].data
+        is_longwave = predictand in lw_flux_predictands
+        xname = 'rrtmgp_lw_input' if is_longwave else 'rrtmgp_sw_input'
+        x_raw = dat.variables[xname][:].data
         input_names = _parse_input_names(xname)
-        nx = x.shape[-1]
-        
-        x = _flatten_expt_site(x)
+        nx = x_raw.shape[-1]
 
-        for i in range(nx):
-          print(f"load_rrtmgp x {input_names[i]}: min {x[:,:,i].min()}, max {x[:,:,i].max()}")
+        if x_raw.ndim != 4:
+            raise ValueError(
+                f"Flux loading expects {xname} with shape (expt, site, layer, feature); "
+                f"got {x_raw.shape}"
+            )
+        nexp, nsite, nlay, _ = x_raw.shape
+        x = _flatten_expt_site(x_raw)
+
+        if input_names is not None:
+            for i in range(nx):
+                print(f"load_rrtmgp x {input_names[i]}: min {x[:,:,i].min()}, max {x[:,:,i].max()}")
 
         col_dry, _ = _get_var(['col_dry'])
         pres_level, _ = _get_var(['pres_level', 'plev', 'pressure_level'])
-        mu0, _ = _get_var(['mu0', 'cos_sza', 'solar_zenith_cosine'])
-        incoming_toa, _ = _get_var(['total_solar_irradiance', 'incoming_toa', 'toa_solar_irradiance', 'solin'])
-        albedo_surf, _ = _get_var(['surface_albedo', 'albedo', 'sfc_albedo'])
-
-        col_dry = _flatten_expt_site(col_dry)
-        pres_level = _flatten_expt_site(pres_level)
-
-        mu0 = np.asarray(mu0).reshape(-1)
-        incoming_toa = np.asarray(incoming_toa).reshape(-1)
-        albedo_surf = np.asarray(albedo_surf).reshape(-1)
+        col_dry = _flatten_or_broadcast_expt_site(col_dry, nexp, nsite, 'col_dry')
+        pres_level = _flatten_or_broadcast_expt_site(pres_level, nexp, nsite, 'pres_level')
 
         if input_norm_coefficients is not None:
             # x2 = _apply_input_norm(x2, input_norm_coefficients)
             x2 = preproc_minmax_inputs_rrtmgp(x.reshape(-1, nx), input_norm_coefficients)
             xmin, xmax = input_norm_coefficients
         else:
+            # Retain the previous behaviour/signature. In normal use existing
+            # gas-optics normalization coefficients should be supplied.
             x2, xmin, xmax = preproc_minmax_inputs_rrtmgp(x.reshape(-1, nx), input_norm_coefficients)
         x = x2.reshape(x.shape[0], x.shape[1], x.shape[2])
 
@@ -373,30 +402,66 @@ def load_rrtmgp(
             col_dry = col_dry[:, ::dcol]
             pres_level = pres_level[:, ::dcol]
 
-        if predictand=="sw_gpt_fluxes":
-          rsu, _      = _get_var(['gpt_flux_up'])
-          rsd, _      = _get_var(['gpt_flux_dn'])
-          rsd_dir, _  = _get_var(['gpt_flux_dn_dir'])
-        else:
-          rsu, _      = _get_var(['rsu'])
-          rsd, _      = _get_var(['rsd'])
-          rsd_dir, _  = _get_var(['rsd_dir'])
-          
-        rsu         = _flatten_expt_site(rsu)
-        rsd         = _flatten_expt_site(rsd)
-        rsd_dir     = _flatten_expt_site(rsd_dir)
-    
-        y = (rsu, rsd, rsd_dir)
+        if is_longwave:
+            if predictand == 'lw_gpt_fluxes':
+                rlu, _ = _get_var(['gpt_flux_up'])
+                rld, _ = _get_var(['gpt_flux_dn'])
+            else:
+                rlu, _ = _get_var(['rlu'])
+                rld, _ = _get_var(['rld'])
 
-        aux = {
-            'mu0': mu0,
-            'incoming_toa': incoming_toa,
-            'total_solar_irradiance': incoming_toa,
-            'surface_albedo': albedo_surf,
-            'pres_level': pres_level,
-            'xmin': xmin,
-            'xmax': xmax,
-        }
+            rlu = _flatten_or_broadcast_expt_site(rlu, nexp, nsite, 'rlu')
+            rld = _flatten_or_broadcast_expt_site(rld, nexp, nsite, 'rld')
+
+            temp_level, _ = _get_var(['temp_level', 'temperature_level', 'tlev'])
+            temp_sfc, _ = _get_var(['sfc_temperature', 'surface_temperature', 'tsfc'])
+            emis_sfc, _ = _get_var(['sfc_emis', 'surface_emissivity', 'emis_sfc'])
+
+            temp_level = _flatten_or_broadcast_expt_site(temp_level, nexp, nsite, 'temp_level')
+            temp_sfc = _flatten_or_broadcast_expt_site(temp_sfc, nexp, nsite, 'sfc_temperature').reshape(-1)
+            emis_sfc = _flatten_or_broadcast_expt_site(emis_sfc, nexp, nsite, 'sfc_emis').reshape(-1)
+
+            y = (rlu, rld)
+            aux = {
+                'temp_level': temp_level,
+                'sfc_temperature': temp_sfc,
+                'sfc_emis': emis_sfc,
+                'pres_level': pres_level,
+                'xmin': xmin,
+                'xmax': xmax,
+            }
+        else:
+            mu0, _ = _get_var(['mu0', 'cos_sza', 'solar_zenith_cosine'])
+            incoming_toa, _ = _get_var(['total_solar_irradiance', 'incoming_toa', 'toa_solar_irradiance', 'solin'])
+            albedo_surf, _ = _get_var(['surface_albedo', 'albedo', 'sfc_albedo'])
+
+            mu0 = _flatten_or_broadcast_expt_site(mu0, nexp, nsite, 'mu0').reshape(-1)
+            incoming_toa = _flatten_or_broadcast_expt_site(incoming_toa, nexp, nsite, 'total_solar_irradiance').reshape(-1)
+            albedo_surf = _flatten_or_broadcast_expt_site(albedo_surf, nexp, nsite, 'surface_albedo').reshape(-1)
+
+            if predictand == 'sw_gpt_fluxes':
+                rsu, _ = _get_var(['gpt_flux_up'])
+                rsd, _ = _get_var(['gpt_flux_dn'])
+                rsd_dir, _ = _get_var(['gpt_flux_dn_dir'])
+            else:
+                rsu, _ = _get_var(['rsu'])
+                rsd, _ = _get_var(['rsd'])
+                rsd_dir, _ = _get_var(['rsd_dir'])
+
+            rsu = _flatten_or_broadcast_expt_site(rsu, nexp, nsite, 'rsu')
+            rsd = _flatten_or_broadcast_expt_site(rsd, nexp, nsite, 'rsd')
+            rsd_dir = _flatten_or_broadcast_expt_site(rsd_dir, nexp, nsite, 'rsd_dir')
+
+            y = (rsu, rsd, rsd_dir)
+            aux = {
+                'mu0': mu0,
+                'incoming_toa': incoming_toa,
+                'total_solar_irradiance': incoming_toa,
+                'surface_albedo': albedo_surf,
+                'pres_level': pres_level,
+                'xmin': xmin,
+                'xmax': xmax,
+            }
 
         return x, y, col_dry, input_names, kdist_str, aux
 

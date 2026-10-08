@@ -8,18 +8,38 @@ from typing import List, Tuple, Final, Optional
 import xarray as xr
 from torchinfo import summary
 
+xmin_sw = np.array([160, 0.00515, 0.0101, 0.00436, 0.000141, 0, 2e-09], dtype=np.float32)
+xmax_sw = np.array([340, 11.6, 0.507753, 0.06316834, 0.0023, 5.813521e-07, 3.6e-06], dtype=np.float32)
+input_names_sw = ["tlay", "play", "h2o", "o3", "co2", "n2o", "ch4"]
+xmin_lw = np.array([160, 0.00515, 0.0101, 0.00436, 0.000141, 2e-09, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+xmax_lw = np.array([340, 11.6, 0.507753, 0.06316834, 0.0028, 4.2e-06, 5.813521e-07, 2e-09, 6e-10, 2.4e-06, 1.03168e-10, 
+                    2.384533e-10, 7.791439e-10, 9.888e-10, 3.106764e-11, 1.364208e-11, 4.233e-10, 1.670263e-10 ], dtype=np.float32)
+input_names_lw = ["tlay", "play", "h2o", "o3", "co2", "ch4", "n2o", "cfc11", "cfc12", "co", "ccl4", "cfc22", "hfc143a", "hfc125", 
+                  "hfc23", "hfc32", "hfc134a", "cf4"]
+
+
+# RRTMGP's 14 SW bands: wavenumber limits and g-point ranges
+RRTMGP_WAVENUM_LOW_SW  = [820, 2680, 3250, 4000, 4650, 5150, 6150, 7700, 8050, 12850, 16000, 22650, 29000, 38000]
+RRTMGP_WAVENUM_HIGH_SW = [2680, 3250, 4000, 4650, 5150, 6150, 7700, 8050, 12850, 16000, 22650, 29000, 38000, 50000]
+RRTMGP_GPT_BOUNDS_SW   = [0, 10, 18, 29, 37, 46, 56, 67, 71, 80, 89, 96, 102, 109, 112]  # g-pt boundary of each RRTMGP band
+
+# RRTMGP's 16 LW bands
+RRTMGP_WAVENUM_LOW_LW = [10, 250, 500, 630, 700, 820, 980, 1080, 1180, 1390, 1480, 1800, 2080, 2250, 2390, 2680]
+RRTMGP_WAVENUM_HIGH_LW = RRTMGP_WAVENUM_LOW_LW[1:] + [3250]
+RRTMGP_GPT_BOUNDS_LW = [0,12,26, 38, 50, 63, 68, 75, 81, 92, 99, 107, 114, 119, 122, 124, 128]
+
 # Band	Wavenum (cm⁻¹)	Wavelength (µm)	Rationale
 # 1	250–4,200	40–2.38		Slingo band 4; thermal NIR, FSCK across weak-sun region
 # 2	4,200–14,500	2.38–0.69	Slingo bands 2+3; H₂O dominated NIR, bulk of solar absorption
 # 3	14,500–16,000	0.69–0.625	~ecCKD boundary; PAR boundary for surface scheme
 # 4	16,000–22,000	0.625–0.45	Chappuis O₃, visible, following ecCKD
 # 5	22,000–50,000	0.45–0.20	UV O₃, following ecCKD
-RRTMGP_SPLITS = [29, 80, 89, 102]
-WAVENUM_SPLITS = [4200, 14500, 16000, 22000]
-# RRTMGP_SPLITS = [80]
+# RRTMGP_SPLITS = [29, 80, 89, 102]
+# WAVENUM_SPLITS = [4200, 14500, 16000, 22000]
+# # RRTMGP_SPLITS = [80]
 
 # Build slice boundaries: [0] + splits + [ng]
-RRTMGP_BOUNDS = [0] + RRTMGP_SPLITS + [112]
+# RRTMGP_BOUNDS = [0] + RRTMGP_SPLITS + [112]
 
 # rrtmgp_sw_solar_source = np.array([6.12496230e+00, 1.93416359e+00, 1.54202784e+00, 1.27604859e+00,
 #        1.40585104e+00, 1.16409128e+00, 7.08588401e-01, 2.38161909e-01,

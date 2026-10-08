@@ -10,9 +10,9 @@ to be a tuple:
     y_ref = (rsu_gpt, rsd_gpt, rsd_dir_gpt)
 with each array shaped (nbatch, nlev, ng_ref).
 
-The model prediction is reduced with my_reduction(). For now this trains on
-broadband fluxes, i.e. a sum over the spectral/g-point dimension. The commented
-section in my_reduction() shows where to replace this with custom band sums.
+The model prediction is reduced with my_reduction(). It is possible to train on
+broadband fluxes, i.e. a sum over the spectral/g-point dimension, or by optimizing fluxes
+in specific bands
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import argparse
 import copy
 from pathlib import Path
 from typing import Dict, Tuple
-
+from random import randrange
 import numpy as np
 import torch
 import torch.nn as nn
@@ -34,9 +34,9 @@ from torch.utils.data import DataLoader, TensorDataset, random_split
 from torchinfo import summary
 
 from gpt_ml_load_save_preproc import (
-    load_CKDMIPstyle_data,
+    load_RFMIP_data,
     load_rrtmgp,
-    prepare_CKDMIP_style_data,
+    prepare_RFMIP_data,
 )
 import gpt_torch_models_rad as radlib
 from gpt_torch_models_rad import (
@@ -44,10 +44,9 @@ from gpt_torch_models_rad import (
     load_gas_optics_from_file,
     mlp_gasopt_inlined_processing,
 )
-from coefficients import RRTMGP_SPLITS#, WAVENUM_SPLITS
+from coefficients import xmin_sw, xmax_sw, xmin_lw, xmax_lw #, WAVENUM_SPLITS
 
-
-CKDMIP_EXPERIMENTS = {
+RFMIP_EXPERIMENTS = {
     0: "Present day (PD)",
     1: "Pre-industrial (PI) greenhouse gas concentrations",
     2: "4xCO2",
@@ -70,20 +69,22 @@ CKDMIP_EXPERIMENTS = {
 
 # Experiment pairs are (perturbed, baseline), matching the requested
 # forcing-error convention: (true2 - true1) - (pred2 - pred1).
-CKDMIP_IRF_PAIRS = {
+RFMIP_IRF_PAIRS = {
     "future_minus_pi": (3, 1),
     "ch4_pd_minus_pi": (0, 9),
+    "co2_8x_minus_0.5x": (7,4),
+
 }
 
-CKDMIP_WANDB_METRICS = (
-    "ckdmip/mae_heating_rate_all",
-    "ckdmip/mae_heating_rate_present_day",
-    "ckdmip/mae_heating_rate_preindustrial",
-    "ckdmip/mae_heating_rate_future_all",
-    "ckdmip/bias_surface_downwelling_flux",
-    "ckdmip/bias_toa_irf_future_minus_pi",
-    "ckdmip/bias_surface_irf_future_minus_pi",
-    "ckdmip/bias_surface_irf_ch4_pd_minus_pi",
+RFMIP_WANDB_METRICS_SW = (
+    "rfmip/mae_heating_rate_all",
+    "rfmip/mae_heating_rate_present_day",
+    "rfmip/mae_heating_rate_preindustrial",
+    "rfmip/mae_heating_rate_future_all",
+    "rfmip/bias_surface_downwelling_flux",
+    "rfmip/bias_toa_irf_future_minus_pi",
+    "rfmip/bias_surface_irf_future_minus_pi",
+    "rfmip/bias_surface_irf_ch4_pd_minus_pi",
 )
 
 # train_on_bands=True 
@@ -177,71 +178,42 @@ def make_band_bounds_sw(
     return rrtmgp_bounds, model_bounds, ng
 
 def my_reduction(
-    rsu_gpt: torch.Tensor,      # (batch, nlev, 112) or (batch, nlev, ng)
-    rsd_gpt: torch.Tensor,
-    rsd_dir_gpt: torch.Tensor, train_on_bands=True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flux_tuple: Tuple[torch.Tensor, ...],
+    bounds: list[int] | None = None,
+) -> Tuple[torch.Tensor, ...]:
     """
-    Reduce g-point fluxes to the 5-band hybrid spectral bands before computing loss.
-    Works for both RRTMGP true fluxes (ng=112) and ML predicted fluxes (ng=8,12,16,32).
+    Reduce spectral fluxes using explicit Python-style g-point bounds.
 
-    The 5 bands (in RRTMGP g-point space, 1-indexed) are:
-      Band 1:  250–4200  cm-1  (Slingo band 4, thermal NIR)         → g-pts  1–29   (RRTMGP bands 1–3)
-      Band 2:  4200–14500 cm-1 (Slingo bands 2+3, solar NIR / H2O)  → g-pts 30–80   (RRTMGP bands 4–9)
-      Band 3:  14500–16000 cm-1 (PAR boundary / ~0.7 µm)            → g-pts 81–89   (RRTMGP band 10)
-      Band 4:  16000–22000 cm-1 (Chappuis O3, visible)              → g-pts 90–102  (RRTMGP bands 11–12)
-      Band 5:  22000–50000 cm-1 (UV, Hartley/Huggins O3)            → g-pts 103–112 (RRTMGP bands 13–14)
+    Parameters
+    ----------
+    flux_tuple
+        Tuple of spectral flux tensors, each shaped (..., ng).
 
-    For ng=112: boundaries are exact (derived from RRTMGP bnd_limits_gpt).
-    For ng<112:  boundaries are scaled proportionally, matching the approach
-                 used in slingo_liq_cloud_optics_sw().
+    bounds
+        Python-style exclusive bounds, e.g.
+            [0, 29, 80, 89, 102, 112]
 
-    Returns:
-        rsu, rsd, rsd_dir: each shaped (batch, nlev, 5)
+        If None, reduce to broadband by summing over all g-points.
+
+    Returns
+    -------
+    Tuple of reduced flux tensors. With explicit bounds, the final dimension
+    is the number of requested bands. With bounds=None, the spectral
+    dimension is removed.
     """
-    if not train_on_bands:
-      rsu = rsu_gpt.sum(dim=-1)
-      rsd = rsd_gpt.sum(dim=-1)
-      rsd_dir = rsd_dir_gpt.sum(dim=-1)
-      return rsu, rsd, rsd_dir
-    else:
-      ng = rsu_gpt.shape[-1]
+    if bounds is None:
+        return tuple(f.sum(dim=-1) for f in flux_tuple)
 
-      # -------------------------------------------------------------------------
-      # Band boundary g-point indices for RRTMGP (ng=112), 0-indexed, exclusive
-      # upper bounds (i.e. Python slice notation: band_k = gpt[..., lb:ub])
-      # Derived from bnd_limits_gpt in RRTMGP:
-      #   Band 1:  g-pts  1–29   → 0:29
-      #   Band 2:  g-pts 30–80   → 29:80
-      #   Band 3:  g-pts 81–89   → 80:89
-      #   Band 4:  g-pts 90–102  → 89:102
-      #   Band 5:  g-pts 103–112 → 102:112
-      # To adjust band boundaries, edit these four split points (in ng=112 space):
-      # RRTMGP_SPLITS = [29, 80, 89, 102]  # 4 interior boundaries → 5 bands
-      # RRTMGP_SPLITS now loaded from coefficients
+    def band_sum(x):
+        return torch.cat(
+            [
+                x[..., bounds[i]:bounds[i + 1]].sum(dim=-1, keepdim=True)
+                for i in range(len(bounds) - 1)
+            ],
+            dim=-1,
+        )
 
-      NG_RRTMGP = 112
-      # -------------------------------------------------------------------------
-
-      if ng == NG_RRTMGP:
-          splits = RRTMGP_SPLITS
-      else:
-          # Scale boundaries proportionally, matching slingo_liq_cloud_optics_sw()
-          splits = [int(round((s / NG_RRTMGP) * ng)) for s in RRTMGP_SPLITS]
-
-      # Build slice boundaries: [0] + splits + [ng]
-      bounds = [0] + splits + [ng]
-      # print("splits", splits, "bounds", bounds)
-          
-      def band_sum(x):
-          # x: (batch, nlev, ng) → (batch, nlev, 5)
-          return torch.cat(
-              [x[..., bounds[i]:bounds[i+1]].sum(dim=-1, keepdim=True)
-              for i in range(len(bounds) - 1)],
-              dim=-1,
-          )
-
-      return band_sum(rsu_gpt), band_sum(rsd_gpt), band_sum(rsd_dir_gpt)
+    return tuple(band_sum(f) for f in flux_tuple)
 
 def flatten_flux_tuple(fluxes: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
     """Concatenate rsu, rsd, rsd_dir after reduction for equal-weighted loss."""
@@ -259,41 +231,50 @@ def flatten_flux_tuple(fluxes: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) 
 
 def compute_band_flux_weights(
     y_ref: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    ref_band_bounds: list[int],
     device: torch.device,
     eps: float = 1.0,
 ) -> torch.Tensor:
     """
     Compute per-band loss weights as the inverse variance of band fluxes across
-    the training set.  Weights are normalised so their mean equals 1, keeping
+    the training set. Weights are normalised so their mean equals 1, keeping
     the overall loss magnitude comparable to the unweighted case.
 
     Args:
-        y_ref:  tuple of (rsu, rsd, rsd_dir) numpy arrays, each (nobs, nlev, 112).
-                These are the full RRTMGP g-point fluxes before any reduction.
+        y_ref: tuple of (rsu, rsd, rsd_dir) numpy arrays containing the full
+               RRTMGP g-point fluxes before reduction.
+        ref_band_bounds: explicit Python-style bounds used to reduce the
+                         reference RRTMGP spectrum to the user-selected bands.
         device: target torch device.
-        eps:    floor added to variance before inversion to avoid division by
-                near-zero variance (e.g. UV band at night-time).
+        eps: floor added to variance before inversion to avoid division by
+             near-zero variance.
 
     Returns:
-        weights: float32 tensor of shape (nband,) = (5,) on `device`.
+        weights: float32 tensor of shape (nband,) on `device`.
     """
-    # Reduce the full training set to band fluxes (CPU, done once)
-    rsu_t   = torch.as_tensor(np.asarray(y_ref[0]),   dtype=torch.float32)
-    rsd_t   = torch.as_tensor(np.asarray(y_ref[1]),   dtype=torch.float32)
-    rsd_dir_t = torch.as_tensor(np.asarray(y_ref[2]), dtype=torch.float32)
+    flux_t = tuple(
+        torch.as_tensor(np.asarray(y), dtype=torch.float32)
+        for y in y_ref
+    )
 
-    rsu_b, rsd_b, rsd_dir_b = my_reduction(rsu_t, rsd_t, rsd_dir_t, train_on_bands=True)  # each (nobs, nlev, nband)
+    rsu_b, rsd_b, rsd_dir_b = my_reduction(
+        flux_t,
+        bounds=ref_band_bounds,
+    )
 
-    # Variance across all (nobs * nlev) samples for each band, averaged over the
-    # three flux components so a single weight applies to all three.
+    # Variance across all (nobs * nlev) samples for each band, averaged over
+    # the three flux components so a single weight applies to all three.
     def _band_var(x):
-        # x: (nobs, nlev, nband) → var over obs+lev dims → (nband,)
         return x.reshape(-1, x.shape[-1]).var(dim=0)
 
-    var = (_band_var(rsu_b) + _band_var(rsd_b) + _band_var(rsd_dir_b)) / 3.0  # (nband,)
+    var = (
+        _band_var(rsu_b)
+        + _band_var(rsd_b)
+        + _band_var(rsd_dir_b)
+    ) / 3.0
 
     weights = 1.0 / (var + eps)
-    weights = weights / weights.mean()   # normalise so mean weight == 1
+    weights = weights / weights.mean()
 
     print("Band flux variances:", var.tolist())
     print("Band loss weights:  ", weights.tolist())
@@ -303,29 +284,37 @@ def compute_band_flux_weights(
 def flux_loss(
     pred_tuple,
     true_tuple,
+    pred_band_bounds: list[int] | None = None,
+    true_band_bounds: list[int] | None = None,
     band_weights: torch.Tensor | None = None,
     alpha: float = 0.0,
     pres: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """
-    MSE loss over band-reduced fluxes, optionally weighted per band.
+    MSE loss over explicitly reduced spectral fluxes, optionally weighted per
+    band. If both band-bound arguments are None, the loss is broadband.
+
+    The prediction and reference use different g-point index spaces, so their
+    reduction bounds are passed separately:
+      - pred_band_bounds: learned-model g-point bounds
+      - true_band_bounds: reference/RRTMGP g-point bounds
+
     If alpha > 0, adds a broadband heating-rate MSE term:
         L = (1 - alpha) * flux_loss + alpha * hr_loss
-
-    band_weights: (nband,) tensor; if None, all bands are weighted equally.
-    alpha:        weight of heating-rate loss component (0 = flux only).
-    pres:         pressure levels (batch, nlev+1), required when alpha > 0.
     """
-    rsu_p, rsd_p, rsd_dir_p = my_reduction(*pred_tuple)
-    rsu_t, rsd_t, rsd_dir_t = my_reduction(*true_tuple)
-
-    # print("Mean of pred rsd_bands across batch,lev ", rsd_p.mean(dim=(0,1)))
-    # print("Mean of pred rsd_dir_bands across batch,lev ", rsd_dir_p.mean(dim=(0,1)))
+    rsu_p, rsd_p, rsd_dir_p = my_reduction(
+        pred_tuple,
+        bounds=pred_band_bounds,
+    )
+    rsu_t, rsd_t, rsd_dir_t = my_reduction(
+        true_tuple,
+        bounds=true_band_bounds,
+    )
 
     def _mse(p, t):
-        sq = (p - t) ** 2                          # (batch, nlev, nband) or (batch, nlev)
+        sq = (p - t) ** 2
         if band_weights is not None and sq.ndim == 3:
-            sq = sq * band_weights                 # broadcast over batch and nlev
+            sq = sq * band_weights
         return sq.mean()
 
     loss_rsu = _mse(rsu_p, rsu_t)
@@ -336,36 +325,23 @@ def flux_loss(
     if alpha == 0.0:
         return loss_flux
 
-    # Heating-rate loss on broadband fluxes (sum over all g-points / bands)
+    # Heating-rate loss is always broadband, independent of the training-band
+    # reduction used for the flux loss.
     assert pres is not None, "pres must be provided when alpha > 0"
-    rsu_p_bb = pred_tuple[0].sum(dim=-1)   # (batch, nlev)
+    rsu_p_bb = pred_tuple[0].sum(dim=-1)
     rsd_p_bb = pred_tuple[1].sum(dim=-1)
     rsu_t_bb = true_tuple[0].sum(dim=-1)
     rsd_t_bb = true_tuple[1].sum(dim=-1)
 
-    hr_p = calc_heatingrate_torch(rsu_p_bb, rsd_p_bb, pres)   # (batch, nlev-1)
+    hr_p = calc_heatingrate_torch(rsu_p_bb, rsd_p_bb, pres)
     hr_t = calc_heatingrate_torch(rsu_t_bb, rsd_t_bb, pres)
     loss_hr = torch.mean((hr_p - hr_t) ** 2)
-    # print("flux term mean", torch.mean((1.0 - alpha) * loss_flux ), "hr", torch.mean(alpha * loss_hr) )
+
     return (1.0 - alpha) * loss_flux + alpha * loss_hr
 
 # -----------------------------------------------------------------------------
 # Model helpers
 # -----------------------------------------------------------------------------
-
-# def _set_uniform_solar_weights(model: nn.Module, ng: int, trainable: bool) -> None:
-#     """
-#     SW_rad_torch currently reads gas_abs.sw_solar_weights directly when gas
-#     optics modules are supplied. For newly initialized gas-optics models, make
-#     sure those weights are non-zero before training.
-#     """
-#     value = torch.full((1, ng), 1.0 / float(ng), device=next(model.parameters()).device)
-#     if hasattr(model, "sw_solar_weights") and isinstance(model.sw_solar_weights, nn.Parameter):
-#         with torch.no_grad():
-#             model.sw_solar_weights.copy_(value)
-#         model.sw_solar_weights.requires_grad = bool(trainable)
-#     else:
-#         model.sw_solar_weights = nn.Parameter(value, requires_grad=bool(trainable))
 
 def _parse_int_list(s: str) -> list[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
@@ -383,6 +359,8 @@ def build_trainable_radiation_model(
 ) -> SW_rad_torch:
     """Construct two new gas-optics MLPs and wrap them in SW_rad_torch."""
 
+    shortwave=True
+
     gas_abs = mlp_gasopt_inlined_processing(
         device=device,
         xmin=xmin,
@@ -395,11 +373,12 @@ def build_trainable_radiation_model(
         nn_b1=None,
         nn_b2=None,
         nn_b3=None,
+        is_longwave=not shortwave,
         solar_source=None,
         rrtmgp_bounds_in=rrtmgp_band_bounds,
         band_bounds=band_bounds,  
         lock_weights=False,
-        ny=ng,
+        ng=ng,
         nh=nh,
         do_norm=do_norm,
     )
@@ -415,11 +394,12 @@ def build_trainable_radiation_model(
         nn_b1=None,
         nn_b2=None,
         nn_b3=None,
+        is_longwave=not shortwave,
         solar_source=None,
         rrtmgp_bounds_in=rrtmgp_band_bounds,
         band_bounds=band_bounds,
         lock_weights=False,
-        ny=ng,
+        ng=ng,
         nh=nh,
         do_norm=do_norm,
     )
@@ -466,20 +446,20 @@ def forward_fluxes(
 # Data loading
 # -----------------------------------------------------------------------------
 
-def load_input_norm_coeffs(
-    gasopt_abs_file: str,
-    device: torch.device,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Load input normalisation coefficients from an existing gas optics file."""
-    gas_abs_dummy = load_gas_optics_from_file(device, gasopt_abs_file)
-    coeffs = (
-        gas_abs_dummy.xmin.detach().cpu().numpy(),
-        gas_abs_dummy.xmax.detach().cpu().numpy(),
-    )
-    del gas_abs_dummy
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    return coeffs
+# def load_input_norm_coeffs(
+#     gasopt_abs_file: str,
+#     device: torch.device,
+# ) -> Tuple[np.ndarray, np.ndarray]:
+#     """Load input normalisation coefficients from an existing gas optics file."""
+#     gas_abs_dummy = load_gas_optics_from_file(device, gasopt_abs_file)
+#     coeffs = (
+#         gas_abs_dummy.xmin.detach().cpu().numpy(),
+#         gas_abs_dummy.xmax.detach().cpu().numpy(),
+#     )
+#     del gas_abs_dummy
+#     if device.type == "cuda":
+#         torch.cuda.empty_cache()
+#     return coeffs
 
 def load_training_data(
     *,
@@ -584,61 +564,61 @@ def calc_heatingrate_torch(fluxup: torch.Tensor, fluxdn: torch.Tensor, pres_leve
     return (24 * 3600) * dTdt
 
 
-def load_ckdmip_validation_data(
+def load_rfmip_validation_data(
     input_norm_coeffs: Tuple[np.ndarray, np.ndarray],
 ) -> Dict[str, np.ndarray]:
-    """Load and preprocess the default CKDMIP/RFMIP validation files once."""
+    """Load and preprocess the default RFMIP validation files once."""
     (
         x_raw,
         pres_level,
         flux_up_true,
         flux_dn_true,
         expt_labels,
-        ckdmip_aux,
-    ) = load_CKDMIPstyle_data(return_aux=True)
+        rfmip_aux,
+    ) = load_RFMIP_data(return_aux=True)
 
-    if x_raw.shape[0] < len(CKDMIP_EXPERIMENTS):
+    if x_raw.shape[0] < len(RFMIP_EXPERIMENTS):
         raise ValueError(
-            f"Expected at least {len(CKDMIP_EXPERIMENTS)} CKDMIP experiments, "
+            f"Expected at least {len(RFMIP_EXPERIMENTS)} RFMIP experiments, "
             f"got {x_raw.shape[0]}"
         )
 
-    prepared = prepare_CKDMIP_style_data(
+    prepared = prepare_RFMIP_data(
         x_raw,
         flux_up_true,
         flux_dn_true,
-        # exp_index_pairs=list(CKDMIP_IRF_PAIRS.values()),
+        # exp_index_pairs=list(RFMIP_IRF_PAIRS.values()),
         input_norm_coefficients=input_norm_coeffs,
         pres_level=pres_level,
-        aux=ckdmip_aux,
+        aux=rfmip_aux,
         # return_full=True,
     )
     prepared["expt_labels"] = expt_labels
 
-    print("Loaded CKDMIP validation data")
+    print("Loaded RFMIP validation data")
     print(f"  experiments: {x_raw.shape[0]}, sites: {x_raw.shape[1]}, layers: {x_raw.shape[2]}")
     print(f"  x shape: {prepared['x'].shape}")
     print(f"  reference flux shape: {prepared['flux_up_true'].shape}")
     return prepared
 
 
-def run_ckdmip_validation(
+def run_rfmip_validation(
     *,
     model: SW_rad_torch,
-    ckdmip_data: Dict[str, np.ndarray],
+    rfmip_data: Dict[str, np.ndarray],
     device: torch.device,
     batch_size: int,
 ) -> Dict[str, float]:
-    """Evaluate the requested CKDMIP heating-rate, flux-bias and IRF metrics."""
+    """Evaluate the requested RFMIP heating-rate, flux-bias and IRF metrics."""
     model.eval()
 
-    x = np.asarray(ckdmip_data["x"])
+    x = np.asarray(rfmip_data["x"])
     nexpt, nsite, nlay, nx = x.shape
     nprof = nexpt * nsite
     nlev = nlay + 1
 
     def _flat(name, trailing_shape):
-        arr = np.asarray(ckdmip_data[name])
+        arr = np.asarray(rfmip_data[name])
         return arr.reshape((nprof,) + trailing_shape)
 
     x_flat = x.reshape(nprof, nlay, nx)
@@ -665,20 +645,20 @@ def run_ckdmip_validation(
             rsu_gpt, rsd_gpt, _ = forward_fluxes(
                 model, xb, colb, mu0b, toab, presb, albedob, printdebug=False
             )
-            # CKDMIP has no reference rsd_dir. The model still returns it, but it
+            # RFMIP has no reference rsd_dir. The model still returns it, but it
             # is intentionally ignored here. Metrics use broadband rsu and rsd.
             rsu_pred_parts.append(rsu_gpt.sum(dim=-1).cpu())
             rsd_pred_parts.append(rsd_gpt.sum(dim=-1).cpu())
 
     rsu_pred = torch.cat(rsu_pred_parts, dim=0).reshape(nexpt, nsite, nlev)
     rsd_pred = torch.cat(rsd_pred_parts, dim=0).reshape(nexpt, nsite, nlev)
-    rsu_true = torch.as_tensor(ckdmip_data["flux_up_true"], dtype=torch.float32)
-    rsd_true = torch.as_tensor(ckdmip_data["flux_dn_true"], dtype=torch.float32)
-    pres = torch.as_tensor(ckdmip_data["pres_level"], dtype=torch.float32)
+    rsu_true = torch.as_tensor(rfmip_data["flux_up_true"], dtype=torch.float32)
+    rsd_true = torch.as_tensor(rfmip_data["flux_dn_true"], dtype=torch.float32)
+    pres = torch.as_tensor(rfmip_data["pres_level"], dtype=torch.float32)
 
     if rsu_true.shape != (nexpt, nsite, nlev) or rsd_true.shape != (nexpt, nsite, nlev):
         raise ValueError(
-            "Expected CKDMIP reference fluxes to have shape "
+            "Expected RFMIP reference fluxes to have shape "
             f"({nexpt}, {nsite}, {nlev}); got rsu={tuple(rsu_true.shape)}, "
             f"rsd={tuple(rsd_true.shape)}"
         )
@@ -714,18 +694,18 @@ def run_ckdmip_validation(
         pred_irf = net_pred[iexp2, :, ilev] - net_pred[iexp1, :, ilev]
         return torch.mean(true_irf - pred_irf)
 
-    future, pi = CKDMIP_IRF_PAIRS["future_minus_pi"]
-    pd, pi_ch4 = CKDMIP_IRF_PAIRS["ch4_pd_minus_pi"]
+    future, pi = RFMIP_IRF_PAIRS["future_minus_pi"]
+    pd, pi_ch4 = RFMIP_IRF_PAIRS["ch4_pd_minus_pi"]
 
     metrics = {
-        "ckdmip/mae_heating_rate_all": float(hr_abs_error.mean()),
-        "ckdmip/mae_heating_rate_present_day": float(hr_abs_error[0].mean()),
-        "ckdmip/mae_heating_rate_preindustrial": float(hr_abs_error[1].mean()),
-        "ckdmip/mae_heating_rate_future_all": float(hr_abs_error[16].mean()),
-        "ckdmip/bias_surface_downwelling_flux": float(surface_dn_bias),
-        "ckdmip/bias_toa_irf_future_minus_pi": float(_irf_bias(future, pi, toa_index)),
-        "ckdmip/bias_surface_irf_future_minus_pi": float(_irf_bias(future, pi, surface_index)),
-        "ckdmip/bias_surface_irf_ch4_pd_minus_pi": float(_irf_bias(pd, pi_ch4, surface_index)),
+        "rfmip/mae_heating_rate_all": float(hr_abs_error.mean()),
+        "rfmip/mae_heating_rate_present_day": float(hr_abs_error[0].mean()),
+        "rfmip/mae_heating_rate_preindustrial": float(hr_abs_error[1].mean()),
+        "rfmip/mae_heating_rate_future_all": float(hr_abs_error[16].mean()),
+        "rfmip/bias_surface_downwelling_flux": float(surface_dn_bias),
+        "rfmip/bias_toa_irf_future_minus_pi": float(_irf_bias(future, pi, toa_index)),
+        "rfmip/bias_surface_irf_future_minus_pi": float(_irf_bias(future, pi, surface_index)),
+        "rfmip/bias_surface_irf_ch4_pd_minus_pi": float(_irf_bias(pd, pi_ch4, surface_index)),
     }
     return metrics
 
@@ -739,6 +719,8 @@ def run_epoch(
     grad_clip: float | None,
     band_weights: torch.Tensor | None = None,
     alpha: float = 0.0,
+    pred_band_bounds: list[int] | None = None,
+    true_band_bounds: list[int] | None = None,
 ) -> Dict[str, float]:
 
     training = optimizer is not None
@@ -772,6 +754,8 @@ def run_epoch(
             loss = flux_loss(
                 y_pred_fluxes,
                 y_true_fluxes,
+                pred_band_bounds=pred_band_bounds,
+                true_band_bounds=true_band_bounds,
                 band_weights=band_weights,
                 alpha=alpha,
                 pres=pres.detach() if alpha > 0.0 else None,
@@ -848,23 +832,64 @@ def parse_args() -> argparse.Namespace:
         description="Train SW gas-optics models through SW_rad_torch using spectral flux targets."
     )
     parser.add_argument("--data-file", required=True, help="NetCDF file containing sw_gpt_fluxes training data")
-    parser.add_argument("--gasopt-abs-file", required=True, help="Existing SW absorption gas-optics NetCDF model; used for input normalization only")
+    # parser.add_argument("--gasopt-abs-file", required=True, help="Existing SW absorption gas-optics NetCDF model; used for input normalization only")
     # parser.add_argument("--gasopt-ray-file", required=True, help="Existing SW Rayleigh gas-optics NetCDF model; used for input normalization only")
     parser.add_argument("--output", default=None, help="Output PyTorch checkpoint (default: auto-generated from hyperparameters)")
     parser.add_argument("--device", default=None, help="Device string, e.g. cuda, cuda:0, cpu")
     parser.add_argument("--ng", type=int, default=16, help="Number of learned spectral/g-point channels in the new gas-optics models")
     parser.add_argument("--nh", type=int, default=32, help="Hidden neurons in each gas-optics MLP hidden layer")
-    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1.0e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--optimizer",
+        choices=["adam", "soap"],
+        default="soap",
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        choices=["none", "plateau", "onecycle"],
+        default="none",
+    )
+
+    parser.add_argument(
+        "--scheduler-max-lr",
+        type=float,
+        default=0.0015, #1.0e-3,
+    )
+
+    parser.add_argument(
+        "--scheduler-min-lr",
+        type=float,
+        default=3e-7, #1.0e-6,
+    )
+
+    parser.add_argument(
+        "--scheduler-peak-epoch",
+        type=int,
+        default=20, # 4?
+    )
+
+    parser.add_argument(
+        "--scheduler-end-epoch",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--scheduler-annealing",
+        choices=["linear", "cos"],
+        default="cos",
+    )
+
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument(
-        "--validate-on-ckdmip",
+        "--validate-on-rfmip",
         action="store_true",
         help=(
-            "At the end of every epoch, evaluate the model on the default CKDMIP "
+            "At the end of every epoch, evaluate the model on the default RFMIP "
             "dataset and log heating-rate, flux-bias and radiative-forcing metrics"
         ),
     )
@@ -897,6 +922,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
 
+    shortwave=True # add support for longwave later
+    if shortwave:
+      prefix = "sw"
+      ng_ref = 112
+    else:
+      prefix = "lw"
+      ng_ref = 128
+
+    model_num = randrange(10,99999)
+
     args = parse_args()
     if args.rrtmgp_splits is None or args.ng_per_band is None:
         print("band training OFF since rrtmgp_splits and ng_per_band were not provided")
@@ -912,14 +947,14 @@ def main() -> None:
             split_str = "-".join(str(x) for x in args.rrtmgp_splits)
             ng_band_str = "-".join(str(x) for x in args.ng_per_band)
             args.output = (
-                f"sw_gasopt"
+                f"trained_models/{prefix}_gasopt"
                 f"_bnd{split_str}"
                 f"_ng{ng_band_str}"
                 f"_nh{args.nh}"
-                f"_alpha{args.alpha:.2f}.pt"
+                f"_alpha{args.alpha:.2f}_num{model_num}.pt"
             )
         else:
-            args.output = f"trained_models/sw_gasopt_ng{ng}_nh{args.nh}_alpha{args.alpha:.2f}.pt"
+            args.output = f"trained_models/{prefix}_gasopt_ng{ng}_nh{args.nh}_alpha{args.alpha:.2f}_num{model_num}.pt"
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -935,9 +970,13 @@ def main() -> None:
             project=args.wandb_project,
             config=vars(args),
         )
-        if args.validate_on_ckdmip:
+        if args.validate_on_rfmip:
             wandb.define_metric("epoch")
-            for metric_name in CKDMIP_WANDB_METRICS:
+            if shortwave:
+              RFMIP_WANDB_METRICS = RFMIP_WANDB_METRICS_SW
+            else:
+              RFMIP_WANDB_METRICS = RFMIP_WANDB_METRICS_LW
+            for metric_name in RFMIP_WANDB_METRICS:
                 wandb.define_metric(metric_name, step_metric="epoch")
 
     def _as_data_file_list(data_file_arg):
@@ -968,21 +1007,31 @@ def main() -> None:
 
     data_files = _as_data_file_list(args.data_file)
 
-    x_all = []
-    y_ref_all = [[], [], []]
-    col_dry_all = []
-    aux_all = []
+    # The first input file defines the primary vertical grid. Files with the same
+    # number of layers are concatenated exactly as before and share the existing
+    # train/validation split. Files with a different nlay get their own training-
+    # only DataLoader. This avoids padding/interpolation solely for batching.
+    primary_nlay = None
+    primary_x_all = []
+    primary_y_ref_all = [[], [], []]
+    primary_col_dry_all = []
+    primary_aux_all = []
+    primary_data_files = []
+    extra_training_sets = []
 
     input_names = None
     kdist_str = None
     # input_norm_coeffs = None
 
-    input_norm_coeffs = load_input_norm_coeffs(args.gasopt_abs_file, device)
-    # xmin, xmax = input_norm_coeffs
+    # input_norm_coeffs = load_input_norm_coeffs(args.gasopt_abs_file, device)
+    if shortwave:
+      input_norm_coeffs = (xmin_sw, xmax_sw)
+    else:
+      input_norm_coeffs = (xmin_lw, xmax_lw)
 
-    ckdmip_data = None
-    if args.validate_on_ckdmip:
-        ckdmip_data = load_ckdmip_validation_data(input_norm_coeffs)
+    rfmip_data = None
+    if args.validate_on_rfmip:
+        rfmip_data = load_rfmip_validation_data(input_norm_coeffs)
 
     for i, data_file in enumerate(data_files):
         x_i, y_ref_i, col_dry_i, aux_i, input_names_i, kdist_str_i = load_training_data(
@@ -997,48 +1046,79 @@ def main() -> None:
             if kdist_str_i != kdist_str:
                 print(f"WARNING: k-dist differs for {data_file}: {kdist_str_i} != {kdist_str}")
             if list(input_names_i) != list(input_names):
-                raise ValueError(f"Input names differ for {data_file}; refusing to concatenate datasets.")
+                raise ValueError(
+                    f"Input names differ for {data_file}; refusing to train on incompatible inputs."
+                )
 
-        x_all.append(np.asarray(x_i))
-        col_dry_all.append(np.asarray(col_dry_i))
-        aux_all.append(aux_i)
+        x_i = np.asarray(x_i)
+        col_dry_i = np.asarray(col_dry_i)
+        y_ref_i = tuple(np.asarray(y) for y in y_ref_i)
+        nlay_i = int(x_i.shape[1])
 
-        y_ref_all[0].append(np.asarray(y_ref_i[0]))
-        y_ref_all[1].append(np.asarray(y_ref_i[1]))
-        y_ref_all[2].append(np.asarray(y_ref_i[2]))
+        if primary_nlay is None:
+            primary_nlay = nlay_i
+
+        if nlay_i == primary_nlay:
+            primary_x_all.append(x_i)
+            primary_col_dry_all.append(col_dry_i)
+            primary_aux_all.append(aux_i)
+            for j in range(3):
+                primary_y_ref_all[j].append(y_ref_i[j])
+            primary_data_files.append(data_file)
+            dataset_role = "primary grid"
+        else:
+            extra_training_sets.append(
+                {
+                    "data_file": data_file,
+                    "x": x_i,
+                    "y_ref": y_ref_i,
+                    "col_dry": col_dry_i,
+                    "aux": aux_i,
+                    "nlay": nlay_i,
+                }
+            )
+            dataset_role = "separate training-only grid"
 
         print(f"Loaded dataset {i + 1}/{len(data_files)}: {Path(data_file).name}")
-        print(f"  x shape: {np.asarray(x_i).shape}")
-        print(f"  col_dry shape: {np.asarray(col_dry_i).shape}")
+        print(f"  role: {dataset_role}; nlay={nlay_i}")
+        print(f"  x shape: {x_i.shape}")
+        print(f"  col_dry shape: {col_dry_i.shape}")
         print(
             "  target flux shapes: "
-            f"rsu={np.asarray(y_ref_i[0]).shape}, "
-            f"rsd={np.asarray(y_ref_i[1]).shape}, "
-            f"rsd_dir={np.asarray(y_ref_i[2]).shape}"
+            f"rsu={y_ref_i[0].shape}, "
+            f"rsd={y_ref_i[1].shape}, "
+            f"rsd_dir={y_ref_i[2].shape}"
         )
 
-    x = np.concatenate(x_all, axis=0)
-    col_dry = np.concatenate(col_dry_all, axis=0)
+    if not primary_x_all:
+        raise RuntimeError("No datasets were assigned to the primary vertical grid")
+
+    # Concatenate only datasets compatible with the primary vertical grid.
+    x = np.concatenate(primary_x_all, axis=0)
+    col_dry = np.concatenate(primary_col_dry_all, axis=0)
     y_ref = (
-        np.concatenate(y_ref_all[0], axis=0),
-        np.concatenate(y_ref_all[1], axis=0),
-        np.concatenate(y_ref_all[2], axis=0),
+        np.concatenate(primary_y_ref_all[0], axis=0),
+        np.concatenate(primary_y_ref_all[1], axis=0),
+        np.concatenate(primary_y_ref_all[2], axis=0),
     )
-    aux = _concat_aux_dicts(aux_all)
+    aux = _concat_aux_dicts(primary_aux_all)
 
     xmin, xmax = input_norm_coeffs
 
-    print(f"Loaded {len(data_files)} dataset(s)")
+    print(f"Loaded {len(data_files)} dataset(s) across {1 + len(extra_training_sets)} loader group(s)")
     print(f"k-dist: {kdist_str}")
-    print(f"combined x shape: {np.asarray(x).shape}")
-    print(f"combined col_dry shape: {np.asarray(col_dry).shape}")
+    print(f"primary nlay: {primary_nlay}")
+    print(f"primary files: {[Path(f).name for f in primary_data_files]}")
+    print(f"primary combined x shape: {x.shape}")
+    print(f"primary combined col_dry shape: {col_dry.shape}")
     print(
-        "combined target flux shapes: "
-        f"rsu={np.asarray(y_ref[0]).shape}, "
-        f"rsd={np.asarray(y_ref[1]).shape}, "
-        f"rsd_dir={np.asarray(y_ref[2]).shape}"
+        "primary combined target flux shapes: "
+        f"rsu={y_ref[0].shape}, "
+        f"rsd={y_ref[1].shape}, "
+        f"rsd_dir={y_ref[2].shape}"
     )
 
+    # Only the primary grid gets a validation split.
     train_loader, val_loader = make_dataloaders(
         x=x,
         y_ref=y_ref,
@@ -1051,30 +1131,61 @@ def main() -> None:
         seed=args.seed,
     )
 
-    # if train_on_bands:
-    #   print("Computing per-band flux weights from training data...")
-    #   band_weights = compute_band_flux_weights(y_ref, device=device)
-    #   ng = args.ng
-    #   splits = [int(round((s / 112) * ng)) for s in RRTMGP_SPLITS]
-    #   # Build slice boundaries: [0] + splits + [ng]
-    #   band_bounds = [0] + splits + [ng]
-    # else:
-    #   band_weights = None 
-    #   band_bounds = None
+    train_loader_specs = [
+        {
+            "name": "primary",
+            "wandb_prefix": "train",
+            "loader": train_loader,
+            "nlay": primary_nlay,
+            "data_files": list(primary_data_files),
+        }
+    ]
+
+    for iextra, extra in enumerate(extra_training_sets, start=1):
+        extra_loader, extra_val_loader = make_dataloaders(
+            x=extra["x"],
+            y_ref=extra["y_ref"],
+            col_dry=extra["col_dry"],
+            aux=extra["aux"],
+            device=device,
+            batch_size=args.batch_size,
+            val_fraction=0.0,
+            preload_gpu=args.preload_gpu,
+            seed=args.seed + iextra,
+        )
+        assert extra_val_loader is None
+        name = f"extra{iextra}_nlay{extra['nlay']}"
+        train_loader_specs.append(
+            {
+                "name": name,
+                "wandb_prefix": f"train_{name}",
+                "loader": extra_loader,
+                "nlay": extra["nlay"],
+                "data_files": [extra["data_file"]],
+            }
+        )
+        print(
+            f"Created training-only loader {name}: "
+            f"{Path(extra['data_file']).name}, {len(extra_loader.dataset)} profiles"
+        )
 
     if train_on_bands:
-        print("Computing per-band flux weights from training data...")
-        band_weights = compute_band_flux_weights(y_ref, device=device)
-
         rrtmgp_bounds, band_bounds, ng = make_band_bounds_sw(
             rrtmgp_splits=args.rrtmgp_splits,
             ng_per_band=args.ng_per_band,
-            ng_ref=112,
+            ng_ref=ng_ref,
         )
 
         print(f"RRTMGP reference band bounds: {rrtmgp_bounds}")
         print(f"Learned model band bounds:    {band_bounds}")
         print(f"Learned model ng:             {ng}")
+
+        print("Computing per-band flux weights from training data...")
+        band_weights = compute_band_flux_weights(
+            y_ref,
+            ref_band_bounds=rrtmgp_bounds,
+            device=device,
+        )
 
     else:
         band_weights = None
@@ -1090,7 +1201,12 @@ def main() -> None:
                 "band_bounds": band_bounds,
                 "rrtmgp_bounds": rrtmgp_bounds,
                 "data_files": data_files,
+                "primary_data_files": primary_data_files,
+                "primary_nlay": primary_nlay,
+                "extra_training_files": [d["data_file"] for d in extra_training_sets],
+                "extra_training_nlay": [d["nlay"] for d in extra_training_sets],
                 "kdist_str": kdist_str,
+                "model_num": model_num,
             },
             allow_val_change=True,
         )
@@ -1111,7 +1227,82 @@ def main() -> None:
         print("Compiling model with torch.compile(...)")
         model = torch.compile(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "soap":
+        from soap import SOAP
+        optimizer = SOAP(model.parameters(), lr = args.lr, betas=(.95, .95), weight_decay=.01, precondition_frequency=2)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    lr_scheduler = None
+
+    if args.lr_scheduler == "onecycle":
+
+        scheduler_end_epoch = (
+            args.scheduler_end_epoch
+            if args.scheduler_end_epoch is not None
+            else args.epochs
+        )
+
+        if args.scheduler_peak_epoch >= scheduler_end_epoch:
+            raise ValueError(
+                "--scheduler-peak-epoch must be smaller than "
+                "--scheduler-end-epoch"
+            )
+
+        max_lr = args.scheduler_max_lr
+        min_lr = args.scheduler_min_lr
+
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lr,
+
+            # Makes initial scheduler LR equal to --lr.
+            div_factor=max_lr / args.lr,
+
+            # Makes final scheduler LR equal to --scheduler-min-lr.
+            final_div_factor=args.lr / min_lr,
+
+            # One scheduler.step() per epoch.
+            total_steps=scheduler_end_epoch,
+
+            pct_start=(
+                args.scheduler_peak_epoch
+                / scheduler_end_epoch
+            ),
+
+            anneal_strategy=args.scheduler_annealing,
+        )
+        print("Initial optimizer LR:", optimizer.param_groups[0]["lr"])
+
+    elif args.lr_scheduler == "plateau":
+        raise NotImplementedError()
+        # if not (0.0 < args.lr_scheduler_factor < 1.0):
+        #     raise ValueError("--lr-scheduler-factor must be between 0 and 1")
+        # if args.lr_scheduler_patience < 0:
+        #     raise ValueError("--lr-scheduler-patience must be >= 0")
+        # if args.min_lr < 0.0:
+        #     raise ValueError("--min-lr must be >= 0")
+        # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        #     optimizer,
+        #     mode="min",
+        #     factor=args.lr_scheduler_factor,
+        #     patience=args.lr_scheduler_patience,
+        #     min_lr=args.min_lr,
+        # )
+        # print(
+        #     "Enabled ReduceLROnPlateau: "
+        #     f"factor={args.lr_scheduler_factor}, "
+        #     f"patience={args.lr_scheduler_patience}, min_lr={args.min_lr}"
+        # )
+    if args.lr > args.scheduler_max_lr:
+        raise ValueError(
+            "--lr must be <= --scheduler-max-lr for OneCycleLR"
+        )
+
+    if args.scheduler_min_lr >= args.lr:
+        raise ValueError(
+            "--scheduler-min-lr must be < --lr"
+        )
 
     best_state = copy.deepcopy(model.state_dict())
     best_val = float("inf")
@@ -1120,15 +1311,32 @@ def main() -> None:
     print("Beginning training, saving model to {} when new validation loss is reached".format(args.output))
 
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(
-            model=model,
-            loader=train_loader,
-            device=device,
-            optimizer=optimizer,
-            grad_clip=args.grad_clip,
-            band_weights=band_weights,
-            alpha=args.alpha,
-        )
+        # Alternate loader order each epoch so an incompatible-grid dataset is
+        # not always the final source of optimizer updates. With two loaders:
+        # odd epochs are primary -> extra, even epochs are extra -> primary.
+        if epoch % 2 == 1:
+            epoch_loader_specs = train_loader_specs
+        else:
+            epoch_loader_specs = list(reversed(train_loader_specs))
+        epoch_lr = optimizer.param_groups[0]["lr"]
+
+        train_metrics_by_name = {}
+        for spec in epoch_loader_specs:
+            train_metrics_by_name[spec["name"]] = run_epoch(
+                model=model,
+                loader=spec["loader"],
+                device=device,
+                optimizer=optimizer,
+                grad_clip=args.grad_clip,
+                band_weights=band_weights,
+                alpha=args.alpha,
+                pred_band_bounds=band_bounds if train_on_bands else None,
+                true_band_bounds=rrtmgp_bounds if train_on_bands else None,
+            )
+
+        # Keep the existing train/* metrics tied to the primary-grid data.
+        # Additional loaders are logged separately below.
+        train_metrics = train_metrics_by_name["primary"]
 
         if val_loader is not None:
             val_metrics = run_epoch(
@@ -1139,6 +1347,8 @@ def main() -> None:
                 grad_clip=None,
                 band_weights=band_weights,
                 alpha=args.alpha,
+                pred_band_bounds=band_bounds if train_on_bands else None,
+                true_band_bounds=rrtmgp_bounds if train_on_bands else None,
             )
             monitor = val_metrics["rmse"]
             val_str = (
@@ -1149,20 +1359,35 @@ def main() -> None:
                 f" - val_rsd_r: {val_metrics['rsd_pearson']:.5f}"
             )
         else:
+            # If primary validation is disabled, retain the original fallback:
+            # checkpointing/scheduling use primary-grid training RMSE only.
             monitor = train_metrics["rmse"]
             val_str = ""
 
-        ckdmip_metrics = None
-        if ckdmip_data is not None:
-            ckdmip_metrics = run_ckdmip_validation(
+        rfmip_metrics = None
+        if rfmip_data is not None:
+            rfmip_metrics = run_rfmip_validation(
                 model=model,
-                ckdmip_data=ckdmip_data,
+                rfmip_data=rfmip_data,
                 device=device,
                 batch_size=args.batch_size,
             )
 
+        lr_before_scheduler = float(optimizer.param_groups[0]["lr"])
+
+        if args.lr_scheduler == "plateau":
+            lr_scheduler.step(monitor)
+
+        elif args.lr_scheduler == "onecycle":
+            if epoch <= scheduler_end_epoch:
+                lr_scheduler.step()
+        lr_after_scheduler = float(optimizer.param_groups[0]["lr"])
+
+        # loader_order_str = " -> ".join(spec["name"] for spec in epoch_loader_specs)
         print(
             f"Epoch {epoch:04d}/{args.epochs}"
+            # f" - loader_order: {loader_order_str}"
+            f" - lr: {lr_before_scheduler:.3e}"
             f" - train_rmse: {train_metrics['rmse']:.2f}"
             f" - train_mse: {train_metrics['mse']:.2f}"
             f" - train_hr_rmse: {train_metrics['hr_rmse']:.2f}"
@@ -1170,17 +1395,29 @@ def main() -> None:
             f" - train_rsd_r: {train_metrics['rsd_pearson']:.5f}"
             f"{val_str}"
         )
-        if ckdmip_metrics is not None:
+
+        for spec in train_loader_specs[1:]:
+            metrics = train_metrics_by_name[spec["name"]]
             print(
-                "  CKDMIP"
-                f" - HR MAE all: {ckdmip_metrics['ckdmip/mae_heating_rate_all']:.4f}"
-                f" - PD: {ckdmip_metrics['ckdmip/mae_heating_rate_present_day']:.4f}"
-                f" - PI: {ckdmip_metrics['ckdmip/mae_heating_rate_preindustrial']:.4f}"
-                f" - future-all: {ckdmip_metrics['ckdmip/mae_heating_rate_future_all']:.4f}"
-                f" - sfc dn bias: {ckdmip_metrics['ckdmip/bias_surface_downwelling_flux']:.4f}"
-                f" - TOA IRF future-PI bias: {ckdmip_metrics['ckdmip/bias_toa_irf_future_minus_pi']:.4f}"
-                f" - sfc IRF future-PI bias: {ckdmip_metrics['ckdmip/bias_surface_irf_future_minus_pi']:.4f}"
-                f" - sfc IRF CH4 PD-PI bias: {ckdmip_metrics['ckdmip/bias_surface_irf_ch4_pd_minus_pi']:.4f}"
+                f"  {spec['name']}"
+                f" - rmse: {metrics['rmse']:.2f}"
+                f" - hr_rmse: {metrics['hr_rmse']:.2f}"
+                f" - rsu_r: {metrics['rsu_pearson']:.5f}"
+                f" - rsd_r: {metrics['rsd_pearson']:.5f}"
+            )
+
+
+        if rfmip_metrics is not None:
+            print(
+                "  RFMIP"
+                f" - HR MAE all: {rfmip_metrics['rfmip/mae_heating_rate_all']:.4f}"
+                f" - PD: {rfmip_metrics['rfmip/mae_heating_rate_present_day']:.4f}"
+                f" - PI: {rfmip_metrics['rfmip/mae_heating_rate_preindustrial']:.4f}"
+                f" - future-all: {rfmip_metrics['rfmip/mae_heating_rate_future_all']:.4f}"
+                f" - sfc dn bias: {rfmip_metrics['rfmip/bias_surface_downwelling_flux']:.4f}"
+                f" - TOA IRF future-PI bias: {rfmip_metrics['rfmip/bias_toa_irf_future_minus_pi']:.4f}"
+                f" - sfc IRF future-PI bias: {rfmip_metrics['rfmip/bias_surface_irf_future_minus_pi']:.4f}"
+                f" - sfc IRF CH4 PD-PI bias: {rfmip_metrics['rfmip/bias_surface_irf_ch4_pd_minus_pi']:.4f}"
             )
 
         if wandb_run is not None:
@@ -1191,10 +1428,25 @@ def main() -> None:
                 "train/hr_rmse": train_metrics["hr_rmse"],
                 "train/rsu_pearson": train_metrics["rsu_pearson"],
                 "train/rsd_pearson": train_metrics["rsd_pearson"],
+                "optimizer/lr": lr_after_scheduler,
                 "monitor/rmse": monitor,
                 "best/rmse": best_val,
                 "early_stop/wait": wait,
             }
+
+            for spec in train_loader_specs[1:]:
+                metrics = train_metrics_by_name[spec["name"]]
+                prefix = spec["wandb_prefix"]
+                wandb_metrics.update(
+                    {
+                        f"{prefix}/mse": metrics["mse"],
+                        f"{prefix}/rmse": metrics["rmse"],
+                        f"{prefix}/hr_rmse": metrics["hr_rmse"],
+                        f"{prefix}/rsu_pearson": metrics["rsu_pearson"],
+                        f"{prefix}/rsd_pearson": metrics["rsd_pearson"],
+                    }
+                )
+
             if val_loader is not None:
                 wandb_metrics.update(
                     {
@@ -1206,8 +1458,8 @@ def main() -> None:
                         "val/bias_sfc_dn_flux": val_metrics["surface_dn_bias"],
                     }
                 )
-            if ckdmip_metrics is not None:
-                wandb_metrics.update(ckdmip_metrics)
+            if rfmip_metrics is not None:
+                wandb_metrics.update(rfmip_metrics)
             wandb_run.log(wandb_metrics, step=epoch)
 
         if monitor < best_val:
@@ -1218,26 +1470,34 @@ def main() -> None:
                 {
                     "model_state_dict": best_state,
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": lr_scheduler.state_dict() if lr_scheduler is not None else None,
                     "epoch": epoch,
                     "best_metric_rmse": best_val,
                     "args": vars(args),
                     "data_files": data_files,
+                    "primary_data_files": primary_data_files,
+                    "primary_nlay": primary_nlay,
+                    "extra_training_files": [d["data_file"] for d in extra_training_sets],
+                    "extra_training_nlay": [d["nlay"] for d in extra_training_sets],
                     "input_names": input_names,
                     "kdist_str": kdist_str,
                     "xmin": xmin,
                     "xmax": xmax,
                     # --- everything needed to reconstruct mlp_gasopt_inlined_processing ---
                     "do_norm": args.do_norm,
-                    #"rrtmgp_splits": rrtmgp_splits,               # List[int] from coefficients.py
-                    "rrtmgp_band_bounds":rrtmgp_bounds, #  [0] + RRTMGP_SPLITS + [112], # List[int], derived but save explicitly
+                    "rrtmgp_band_bounds": rrtmgp_bounds,          # Explicit reference/RRTMGP bounds
                     "band_bounds": band_bounds,                    # List[int] or None
                     "train_on_bands": train_on_bands,
                 },
                 args.output,
             )
          
-            abs_path = args.output.replace(".pt", "_abs.pt")
-            ray_path = args.output.replace(".pt", "_ray.pt")
+            if shortwave:
+              abs_path = args.output.replace(".pt", "_abs.pt")
+              ray_path = args.output.replace(".pt", "_ray.pt")
+            else:
+              raise NotImplementedError()
+
             torch.save({
                 "model_state_dict": {
                     k.removeprefix("gas_optics_model_sw_abs."): v
